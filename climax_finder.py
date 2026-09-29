@@ -404,16 +404,24 @@ def _parse_transcript(p: Path, stem: str) -> Optional[List[dict]]:
 
 def text_score_at(segs: List[dict], t: float, cues: CueRules,
                   radius: float = 6.0) -> Tuple[int, List[str], str]:
-    """候选点 ±radius 秒内最强的一条线索。返回 (权重, 标签, 那句原文)。"""
-    best, tags, text = 0, [], ""
+    """候选点 ±radius 秒内最强的一条线索。返回 (权重, 标签, 那句原文)。
+
+    `text` 一定返回**最近的那句台词**（即使没有任何线索命中）——
+    用户需要看到候选点上到底在说什么，而不是只有命中关键词时才有内容。
+    """
+    best, tags = 0, []
+    best_text, best_d = "", radius + 1e-9
     for s in segs:
-        if abs(s["start"] - t) > radius:
-            continue
+        d = abs(s["start"] - t)
         ja = s.get("ja") or ""
+        if d < best_d and ja:
+            best_d, best_text = d, ja
+        if d > radius:
+            continue
         w, tg = cues.score(ja)
         if w > best:
-            best, tags, text = w, tg, ja
-    return best, tags, text
+            best, tags = w, tg
+    return best, tags, best_text
 
 
 def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
