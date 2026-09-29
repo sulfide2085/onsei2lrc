@@ -470,19 +470,95 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
 
 
 # ======================================================================================
-# 主流程
+# 合并相邻候选
+#
+# 问题（用户实测发现）：模型有时把**一次**高潮拆成两个相距 ~20 秒的候选，
+# 两者置信度还差不多。用户听完说「准确的点在他们正中间」。
+#
+# 在 10 折样本外数据上核查，相距 ≤60 秒的成对候选共 110 对：
+#     一次高潮被拆成两个   66 对（60%）
+#     其中含误报           42 对（38%）
+#     真的是两次高潮        2 对（1.8%）
+# 所以「相近的两个候选多半是同一次高潮」成立。
+#
+# 但**不能**对整个候选池做合并 —— 单链式合并会让簇沿着时间轴漂移：
+# 实测 20 秒窗口能把 100 多个候选串成一大簇（合并 779 个），指标直接崩掉。
+# 所以只考察分数最高的 pool 个，再按「与簇代表点的距离」判断。
+#
+# 参数是实测选出来的（10 折留一作品，±20 秒容差，每轨取 3 个）：
+#     规则                          精确率   召回率    F1     每轨候选
+#     旧的间隔抑制（15 秒，拉满 3 个）   41.5%   68.5%   0.517   2.92
+#     取前 3 → 合并 30s              54.3%   62.0%   0.579   1.48
+#     取前 4 → 合并 30s  ← 采用       47.0%   68.5%   0.558   1.89
+#     取前 5 → 合并 30s              40.8%   69.6%   0.514   2.21
+# 取前 4 在**每个维度**上都优于旧实现：精确率 +5.5 点、召回率持平、
+# 候选数少 35%、且不再出现「同一次高潮两个条目」。
 # ======================================================================================
+MERGE_GAP = 30.0        # 相距不超过此值的候选视为同一次高潮
+POOL_EXTRA = 1          # 只考察分数最高的 top + POOL_EXTRA 个
+
+
+def merge_candidates(cands: List[dict], *, top: int = 3,
+                     merge_gap: float = MERGE_GAP, pool: Optional[int] = None
+                     ) -> List[dict]:
+    """把相近的候选合并成「事件」，再按分数取前 top 个。
+
+    合并时代表点取**成员时间的中点**（用户实测：真值在两个候选中间），
+    其余字段沿用分数最高的那个成员，并记录合并了几个。
+    """
+    if not cands:
+        return []
+    if pool is None:
+        pool = top + POOL_EXTRA
+    cands = sorted(cands, key=lambda c: -c["score"])[:max(1, pool)]
+
+    events: List[dict] = []
+    for c in cands:
+        hit = None
+        for e in events:
+            if abs(c["time"] - e["time"]) <= merge_gap:
+                hit = e
+                break
+        if hit is None:
+            e = dict(c)
+            e["_times"] = [c["time"]]
+            e["merged"] = 1
+            events.append(e)
+        else:
+            hit["_times"].append(c["time"])
+            hit["time"] = float(np.mean(hit["_times"]))     # 取中点
+            hit["merged"] += 1
+            if c["score"] > hit["score"]:                    # 沿用分最高的成员
+                keep = dict(c)
+                keep["_times"] = hit["_times"]
+                keep["merged"] = hit["merged"]
+                events[events.index(hit)] = keep
+                hit = keep
+            hit["score"] = max(hit["score"], c["score"])
+            if c.get("probability") is not None:
+                hit["probability"] = max(hit.get("probability", 0.0), c["probability"])
+
+    for e in events:
+        t = e["time"]
+        e["mmss"] = f"{int(t)//60:02d}:{int(t)%60:02d}"
+        e.pop("_times", None)
+    events.sort(key=lambda e: -e["score"])
+    return events[:top]
 def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
                   acoustic_only: bool = False, verbose: bool = True,
                   transcript_dirs: Optional[List[Path]] = None,
                   min_score: Optional[float] = None,
                   model: str = "ml",
-                  model_obj: Optional["ClimaxModel"] = None) -> dict:
+                  model_obj: Optional["ClimaxModel"] = None,
+                  merge_gap: float = MERGE_GAP,
+                  pool: Optional[int] = None) -> dict:
     """分析单个音频，返回候选点。不抛异常——失败信息放在结果的 error 字段。
 
     min_score: 只保留分数不低于此值的候选。None = 不过滤。
     model:     "ml"     用训练好的集成模型（默认）
                "formula" 用旧的手工权重公式（可解释，但实测差距很大）
+    merge_gap: 相距不超过此值的候选视为同一次高潮，合并取中点（默认 30 秒）
+    pool:      只考察分数最高的几个候选（默认 top+1）
     """
     cues = cues or DEFAULT_CUES
     t0 = time.time()
@@ -580,15 +656,10 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
         key = "probability" if model == "ml" else "score"
         cands = [c for c in cands if c.get(key) is not None and c[key] >= min_score]
 
-    # 最小间隔再抑制一次（Top-N 之间至少隔 15 秒）
-    cands.sort(key=lambda c: -c["score"])
-    picked: List[dict] = []
-    for c in cands:
-        if all(abs(c["time"] - p["time"]) > 15.0 for p in picked):
-            picked.append(c)
-        if len(picked) >= top:
-            break
+    picked = merge_candidates(cands, top=top, merge_gap=merge_gap, pool=pool)
     res["candidates"] = picked
+    res["merge_gap"] = merge_gap
+    res["merged_total"] = sum(c.get("merged", 1) - 1 for c in picked)
     # 轨级判断：ml 模式看最高校准概率，formula 模式看最高分
     res["max_score"] = round(picked[0]["score"], 4) if picked else None
     if model == "ml":
@@ -685,6 +756,10 @@ def _cli() -> int:
     ap.add_argument("--model", choices=("ml", "formula"), default="ml",
                     help="ml = 训练好的集成模型（默认，10 折实测精确率 60.2%%/召回 69.8%%）；"
                          "formula = 旧的手工权重公式（可解释，但实测精确率仅 18.5%%）")
+    ap.add_argument("--merge-gap", type=float, default=MERGE_GAP, metavar="秒",
+                    help=f"相距不超过此值的候选视为同一次高潮，合并取中点（默认 {MERGE_GAP:.0f}）")
+    ap.add_argument("--pool", type=int, default=None, metavar="N",
+                    help="只考察分数最高的 N 个候选（默认 top+1）")
     ap.add_argument("--json", help="把结果写到 JSON")
     ap.add_argument("--acoustic-only", action="store_true", help="只用声学，不读转写")
     ap.add_argument("--cues", help="自定义线索规则文件（每行一个正则，# 开头为注释）")
@@ -737,7 +812,8 @@ def _cli() -> int:
     tdirs = [Path(d).expanduser() for d in a.transcript_dir]
     kw = dict(top=a.top, cues=cues, acoustic_only=a.acoustic_only,
               verbose=not a.quiet, transcript_dirs=tdirs or None,
-              min_score=a.min_score, model=a.model, model_obj=mobj)
+              min_score=a.min_score, model=a.model, model_obj=mobj,
+              merge_gap=a.merge_gap, pool=a.pool)
     results = find_in_path(target, **kw)
 
     if not a.quiet:

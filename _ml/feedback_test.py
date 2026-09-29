@@ -19,9 +19,12 @@ def ck(n, ok, d=""):
     print(f"  {'✓' if ok else '✗'} {n}" + (f"　{d}" if d else ""))
 
 
-# 先备份已有标注，测试后恢复
+# 先备份已有标注，测试后恢复。
+# 必须**清空**再测：✓/✗ 是切换语义，如果同一时刻已有标注，
+# 点一下反而变成撤销，断言就会假失败（之前踩过）。
 backup = FB.read_text(encoding="utf-8") if FB.exists() else None
-before = len(FB.read_text(encoding="utf-8").splitlines()) if FB.exists() else 0
+FB.write_text("", encoding="utf-8")
+before = 0
 
 with sync_playwright() as pw:
     br = pw.chromium.launch(channel="chrome",
@@ -74,9 +77,12 @@ with sync_playwright() as pw:
     print("=" * 80)
     print("④ 点行主体仍能跳转")
     print("=" * 80)
-    pg.locator("#hits .hit").nth(2).locator(".t").click()
+    # 合并后候选可能只有 2 个，按实际数量取
+    n_hit = pg.locator("#hits .hit").count()
+    idx = min(2, n_hit - 1)
+    pg.locator("#hits .hit").nth(idx).locator(".t").click()
     pg.wait_for_timeout(600)
-    tgt = pg.evaluate("cands[2].time")
+    tgt = pg.evaluate(f"cands[{idx}].time")
     ck("点行跳转到候选点前 2 秒",
        abs(pg.evaluate("au.currentTime") - max(0, tgt - 2)) < 2.5,
        f"{pg.evaluate('au.currentTime'):.0f}s / 目标 {max(0,tgt-2):.0f}s")

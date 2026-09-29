@@ -43,15 +43,26 @@ app = FastAPI(title="climax player")
 # 模型（7 MB，首次用到时加载；分析是 CPU 密集，串行执行）
 # ---------------------------------------------------------------------------
 _MODEL = None
+_MODEL_MTIME = 0.0
 _MODEL_LOCK = threading.Lock()
 _ANALYZE_LOCK = threading.Lock()
 
 
 def get_model() -> "CF.ClimaxModel":
-    global _MODEL
+    """按需加载模型；**模型文件变了就自动重载**。
+
+    这样你标完、跑完 `python _ml\\train_model.py` 之后，
+    下一次点「分析高潮点」就用上新模型了，不用重启服务。
+    """
+    global _MODEL, _MODEL_MTIME
     with _MODEL_LOCK:
-        if _MODEL is None:
+        try:
+            mt = CF.MODEL_FILE.stat().st_mtime
+        except OSError:
+            mt = 0.0
+        if _MODEL is None or mt != _MODEL_MTIME:
             _MODEL = CF.ClimaxModel()
+            _MODEL_MTIME = mt
     return _MODEL
 
 
@@ -232,10 +243,13 @@ def api_analyze(req: AnalyzeReq, request: Request):
         cands.append({"time": c["time"], "mmss": c["mmss"], "prob": round(prob, 4),
                       "raw": c["score"], "conf": c["confidence"],
                       "text": c.get("text", ""), "note": c.get("confidence_note", ""),
+                      "merged": int(c.get("merged", 1)),
                       "feats": feats})
     return {"ok": True, "duration": round(res.get("duration", 0), 2),
             "candidates": cands, "has_climax": res.get("has_climax"),
             "max_prob": res.get("max_prob"), "elapsed": round(time.time() - t0, 1),
+            "merge_gap": res.get("merge_gap"),
+            "merged_total": res.get("merged_total", 0),
             "lrc": _find_lrc(p).name if _find_lrc(p) else "",
             "model": model.meta}
 
@@ -455,6 +469,8 @@ button.ghost{background:transparent}
   text-overflow:ellipsis;white-space:nowrap}
 .hit.hi .p{color:var(--hot)} .hit.mid .p{color:var(--warn)} .hit.lo .p{color:var(--dim)}
 .hit .vb{display:flex;gap:4px;flex:none}
+.hit .mg{flex:none;font-size:11px;color:#8b93a3;background:#232a34;
+  border:1px solid var(--line);border-radius:5px;padding:1px 6px;cursor:help}
 .hit .vb button{padding:2px 9px;font-size:13px;line-height:1.5;border-radius:6px;
   background:transparent;border:1px solid var(--line);color:var(--dim)}
 .hit .vb button:hover{background:#2c333e;color:var(--fg)}
@@ -801,6 +817,9 @@ function renderHits(){
     el.innerHTML = `<span class="t">${c.mmss}</span>`
       + `<span class="p">${Math.round(c.prob*100)}%</span>`
       + `<span class="x">${esc(c.text || '')}</span>`
+      + (c.merged > 1
+          ? `<span class="mg" title="附近 ${c.merged} 个候选合并为一点，取其中间时刻">合${c.merged}</span>`
+          : '')
       + `<span class="vb">`
       +   `<button class="y" data-v="1" title="确认是高潮">✓</button>`
       +   `<button class="n" data-v="0" title="不是高潮">✗</button>`

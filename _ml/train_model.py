@@ -20,7 +20,8 @@ import numpy as np
 
 from climax_finder import (MODEL_FEATS, SR, HOP, MIN_DURATION, energy_envelope,
                            find_peaks, _smooth, model_features, load_transcript,
-                           text_score_at, DEFAULT_CUES)
+                           text_score_at, DEFAULT_CUES, merge_candidates,
+                           MERGE_GAP, POOL_EXTRA)
 
 TOL = 20.0
 TOPN = 3
@@ -191,9 +192,17 @@ def auc(p, rs):
 
 
 def prec_rec(p, rs, topn=TOPN):
+    """按**工具实际的候选选取方式**评估。
+
+    ⚠️ 这里以前是「直接取分数最高的 topn 个」，没有实现工具里的间隔抑制。
+    实测过这个差别很大：不抑制时精确率 60.9%，工具实际只有 41.5% —— 报出去
+    的数字比工具真实表现偏乐观了近 20 个点。现在直接调用
+    climax_finder.merge_candidates，保证评估口径和工具完全一致。
+    """
     tc = defaultdict(list)
     for r, s in zip(rs, p):
-        tc[(r["rj"], r["track"])].append((s, r))
+        tc[(r["rj"], r["track"])].append(
+            {"time": float(r["t"]), "score": float(s), "mmss": "", "merged": 1})
     tp = nc = 0
     cov = set(); gtot = 0
     gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
@@ -204,9 +213,9 @@ def prec_rec(p, rs, topn=TOPN):
         if g is None:
             continue
         gtot += len(g)
-        for s, r in sorted(cand, key=lambda x: -x[0])[:topn]:
+        for c in merge_candidates(cand, top=topn):
             nc += 1
-            h = [x for x in g if abs(r["t"] - x) <= TOL]
+            h = [x for x in g if abs(c["time"] - x) <= TOL]
             if h:
                 tp += 1
                 for x in h:
@@ -271,6 +280,8 @@ payload = {
         "sklearn_models": {"RF": RF_KW, "HGB": HGB_KW, "LR": LR_KW},
         "ensemble": "equal-weight average of RF + HGB + LR probabilities",
         "note": "排序用 predict_raw（原始平均分）；predict_prob 仅供显示与阈值",
+        "merge_gap": MERGE_GAP, "pool_extra": POOL_EXTRA,
+        "select": "merge_candidates: 取分最高的 top+1 个，30 秒内合并取中点，再取前 top",
     },
 }
 with open(OUT, "wb") as fh:
