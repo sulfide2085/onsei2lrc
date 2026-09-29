@@ -21,7 +21,7 @@ import numpy as np
 from climax_finder import (MODEL_FEATS, SR, HOP, MIN_DURATION, energy_envelope,
                            find_peaks, _smooth, model_features, load_transcript,
                            text_score_at, DEFAULT_CUES, merge_candidates,
-                           MERGE_GAP, POOL_EXTRA)
+                           snap_to_peak, MERGE_GAP, POOL_EXTRA, SNAP_WINDOW)
 
 TOL = 20.0
 TOPN = 3
@@ -202,7 +202,8 @@ def prec_rec(p, rs, topn=TOPN):
     tc = defaultdict(list)
     for r, s in zip(rs, p):
         tc[(r["rj"], r["track"])].append(
-            {"time": float(r["t"]), "score": float(s), "mmss": "", "merged": 1})
+            {"time": float(r["t"]), "score": float(s), "mmss": "",
+             "peak": float(r.get("peak", 0.0))})
     tp = nc = 0
     cov = set(); gtot = 0
     gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
@@ -213,7 +214,8 @@ def prec_rec(p, rs, topn=TOPN):
         if g is None:
             continue
         gtot += len(g)
-        for c in merge_candidates(cand, top=topn):
+        events = snap_to_peak(merge_candidates(cand, top=topn), cand)
+        for c in events:
             nc += 1
             h = [x for x in g if abs(c["time"] - x) <= TOL]
             if h:
@@ -280,8 +282,8 @@ payload = {
         "sklearn_models": {"RF": RF_KW, "HGB": HGB_KW, "LR": LR_KW},
         "ensemble": "equal-weight average of RF + HGB + LR probabilities",
         "note": "排序用 predict_raw（原始平均分）；predict_prob 仅供显示与阈值",
-        "merge_gap": MERGE_GAP, "pool_extra": POOL_EXTRA,
-        "select": "merge_candidates: 取分最高的 top+1 个，30 秒内合并取中点，再取前 top",
+        "merge_gap": MERGE_GAP, "pool_extra": POOL_EXTRA, "snap": SNAP_WINDOW,
+        "select": "取分最高的 top+1 个 → 30 秒内合并取中点 → 吸附到 ±12 秒内最大峰",
     },
 }
 with open(OUT, "wb") as fh:

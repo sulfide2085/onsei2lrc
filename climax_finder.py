@@ -497,6 +497,52 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
 MERGE_GAP = 30.0        # 相距不超过此值的候选视为同一次高潮
 POOL_EXTRA = 1          # 只考察分数最高的 top + POOL_EXTRA 个
 
+# ======================================================================================
+# 时间吸附：把选中的候选挪到附近能量最大的峰
+#
+# 问题（用户听着发现的）：候选池里明明有很准的峰，模型却挑了个偏的。
+# 实测（10 折留一作品，分作品看「离真值最近的峰」的中位误差）：
+#     RJ01583845 1.3 秒   RJ362169 1.6 秒   RJ324692 2.0 秒
+#     RJ01610459 2.2 秒   RJ01586001 2.4 秒
+# 而模型**实际选中**的候选，中位误差是 4~11 秒。差距全在「挑哪个峰」上。
+#
+# 近邻峰之间有可分的特征（真值 ±15 秒内，「最近峰」对「其它峰」的标准化均值差）：
+#     prominence  18.96 vs 15.59   （+0.65）
+#     peak        24.20 vs 21.27   （+0.56）
+#     rank_energy 15.5  vs 26.5    （−0.47，越小越靠前）
+# 也就是**最近的那个峰更突出、更响、轨内能量排名更高**。
+#
+# 所以选完之后再吸附一次。窗口扫描（精确率 / 召回率 / ≤5 秒比例 / 平均误差）：
+#     不吸附         57.8% / 68.5% / 35% / 7.9 秒   ← 现状
+#     ±6 秒         57.8% / 68.5% / 43% / 7.6 秒
+#     ±12 秒 ←采用   57.8% / 68.5% / 52% / 6.8 秒
+#     ±20 秒         56.9% / 65.2% / 58% / 6.4 秒
+#     ±25 秒         59.6% / 66.3% / 60% / 6.0 秒   ← 均值更好，但 10 部里 3 部变差
+# ±12 是「免费」的：精确率与召回率**都不变**，≤5 秒的比例从 35% 提到 52%。
+# 而且 12 秒 < 合并窗口 30 秒 —— 吸附不会跳到相邻的另一次高潮上去。
+# ======================================================================================
+SNAP_WINDOW = 12.0
+
+
+def snap_to_peak(events: List[dict], pool: List[dict],
+                 window: float = SNAP_WINDOW) -> List[dict]:
+    """把每个事件的时间挪到 ±window 秒内**能量最大**的峰。
+
+    pool 里的候选必须带 `peak`（相对全轨中位数的 dB）。
+    """
+    if window <= 0 or not events:
+        return events
+    for e in events:
+        near = [c for c in pool if abs(c["time"] - e["time"]) <= window]
+        if not near:
+            continue
+        best = max(near, key=lambda c: c.get("peak", -1e9))
+        if abs(best["time"] - e["time"]) > 1e-6:
+            e["snapped_from"] = e["time"]
+            e["time"] = best["time"]
+            e["mmss"] = f"{int(best['time'])//60:02d}:{int(best['time'])%60:02d}"
+    return events
+
 
 def merge_candidates(cands: List[dict], *, top: int = 3,
                      merge_gap: float = MERGE_GAP, pool: Optional[int] = None
@@ -551,7 +597,8 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
                   model: str = "ml",
                   model_obj: Optional["ClimaxModel"] = None,
                   merge_gap: float = MERGE_GAP,
-                  pool: Optional[int] = None) -> dict:
+                  pool: Optional[int] = None,
+                  snap: float = SNAP_WINDOW) -> dict:
     """分析单个音频，返回候选点。不抛异常——失败信息放在结果的 error 字段。
 
     min_score: 只保留分数不低于此值的候选。None = 不过滤。
@@ -559,6 +606,7 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
                "formula" 用旧的手工权重公式（可解释，但实测差距很大）
     merge_gap: 相距不超过此值的候选视为同一次高潮，合并取中点（默认 30 秒）
     pool:      只考察分数最高的几个候选（默认 top+1）
+    snap:      选完后把时间吸附到 ±snap 秒内能量最大的峰（默认 12；0 = 关闭）
     """
     cues = cues or DEFAULT_CUES
     t0 = time.time()
@@ -657,8 +705,11 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
         cands = [c for c in cands if c.get(key) is not None and c[key] >= min_score]
 
     picked = merge_candidates(cands, top=top, merge_gap=merge_gap, pool=pool)
+    picked = snap_to_peak(picked, cands, window=snap)
+    picked.sort(key=lambda c: -c["score"])
     res["candidates"] = picked
     res["merge_gap"] = merge_gap
+    res["snap"] = snap
     res["merged_total"] = sum(c.get("merged", 1) - 1 for c in picked)
     # 轨级判断：ml 模式看最高校准概率，formula 模式看最高分
     res["max_score"] = round(picked[0]["score"], 4) if picked else None
@@ -760,6 +811,8 @@ def _cli() -> int:
                     help=f"相距不超过此值的候选视为同一次高潮，合并取中点（默认 {MERGE_GAP:.0f}）")
     ap.add_argument("--pool", type=int, default=None, metavar="N",
                     help="只考察分数最高的 N 个候选（默认 top+1）")
+    ap.add_argument("--snap", type=float, default=SNAP_WINDOW, metavar="秒",
+                    help=f"选完后把时间吸附到 ±此值内能量最大的峰（默认 {SNAP_WINDOW:.0f}；0 = 关闭）")
     ap.add_argument("--json", help="把结果写到 JSON")
     ap.add_argument("--acoustic-only", action="store_true", help="只用声学，不读转写")
     ap.add_argument("--cues", help="自定义线索规则文件（每行一个正则，# 开头为注释）")
@@ -813,7 +866,7 @@ def _cli() -> int:
     kw = dict(top=a.top, cues=cues, acoustic_only=a.acoustic_only,
               verbose=not a.quiet, transcript_dirs=tdirs or None,
               min_score=a.min_score, model=a.model, model_obj=mobj,
-              merge_gap=a.merge_gap, pool=a.pool)
+              merge_gap=a.merge_gap, pool=a.pool, snap=a.snap)
     results = find_in_path(target, **kw)
 
     if not a.quiet:
