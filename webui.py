@@ -968,24 +968,6 @@ def run_pipeline(run_id: str) -> None:
         if aux_pairs:
             log_to(st, f"  （{len(aux_pairs)} 个翻译缓存留在输出目录，不放进下载包）")
 
-        # ---- 6) 文件夹模式：把字幕写回音频所在目录（只新增文件，绝不改动/删除原文件）----
-        # 只写 .lrc：.segments.json 是本工具的翻译缓存，不属于给用户看的产物，
-        # 写进音频目录只会造成困扰（还可能在换模型重译时被误当成结果）。
-        if src_dir and o.get("write_back"):
-            n = 0
-            for src, arc in produced:
-                if not arc.lower().endswith(".lrc"):
-                    continue
-                dst = Path(src_dir) / arc
-                try:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, dst)
-                    n += 1
-                except OSError as e:
-                    log_to(st, f"  ✗ 写回失败 {dst.name}: {e}")
-            log_to(st, f"[写回] 已把 {n} 个字幕文件写入 {src_dir}")
-            st["written_back"] = n
-
         st["elapsed"] = time.time() - t0
         st["state"] = "done"
         st["resume"] = False            # 跑完了，下次不用再续
@@ -1316,7 +1298,6 @@ async def run(payload: dict) -> dict:
         "top_p": payload.get("top_p"),
         "frequency_penalty": payload.get("frequency_penalty"),
         "max_tokens": payload.get("max_tokens"),
-        "write_back": bool(payload.get("write_back", True)),
         "glossary_text": payload.get("glossary_text", "") or "",
         "fix_text": payload.get("fix_text", "") or "",
     }
@@ -1337,6 +1318,47 @@ async def run(payload: dict) -> dict:
     pos = enqueue(run_id)
     _save_task(st)
     return {"ok": True, "queued": True, "position": pos}
+
+
+@app.post("/api/write-back")
+async def write_back(payload: dict) -> dict:
+    """把某个任务产出的 .lrc 写回音频所在文件夹。
+
+    改成按钮触发（原来是跑完自动执行），因为写回会改动用户的素材目录，
+    应该由用户明确地按一下。只**新增** .lrc，绝不改动或删除任何原有文件；
+    同名文件会被覆盖，前端会先提示。
+
+    `ja` 与下载区的「附带日文 lrc」同一个开关：下载会给你什么，写回就写什么。
+    """
+    run_id = payload.get("run_id", "")
+    st = RUNS.get(run_id)
+    if not st:
+        raise HTTPException(404, "run_id 不存在")
+    src_dir = st.get("src_dir")
+    if not src_dir:
+        raise HTTPException(400, "这个任务不是文件夹模式，没有可写回的目标目录")
+    if not Path(src_dir).is_dir():
+        raise HTTPException(400, f"音频目录已不存在：{src_dir}")
+    want_ja = bool(payload.get("ja", 0))
+
+    pairs = [(s, a) for s, a in (st.get("lrc_pairs") or []) if a.lower().endswith(".lrc")]
+    if not want_ja:
+        pairs = [(s, a) for s, a in pairs if not a.lower().endswith(".ja.lrc")]
+    if not pairs:
+        raise HTTPException(400, "这次任务还没有产出字幕")
+
+    n, failed = 0, []
+    for src, arc in pairs:
+        dst = Path(src_dir) / arc
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            n += 1
+        except OSError as e:
+            failed.append(f"{arc}: {e}")
+    log_to(st, f"[写回] 已把 {n} 个字幕文件写入 {src_dir}")
+    return {"ok": True, "written": n, "failed": failed,
+            "total": len(pairs), "dir": src_dir}
 
 
 @app.get("/api/queue")
@@ -1407,9 +1429,14 @@ async def status(run_id: str, since: int = 0) -> dict:
         start = max(0, since - off)
         lines = st["log"][start:]
         nxt = off + len(st["log"])
+    pairs = st.get("lrc_pairs") or []
     return {"state": st["state"], "log": lines, "next": nxt,
             "progress": progress_view(st), "outputs": st["outputs"],
             "has_audio": bool(st.get("has_audio")), "need_mp3": bool(st.get("need_mp3")),
+            # 供「字幕写回」按钮判断是否可用（只有文件夹模式才有目标目录）
+            "src_dir": st.get("src_dir") or "",
+            "lrc_count": len(pairs),
+            "lrc_ja_count": sum(1 for _, a in pairs if a.lower().endswith(".ja.lrc")),
             "error": st["error"], "elapsed": round(st.get("elapsed", 0), 1)}
 
 
@@ -1709,9 +1736,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
         <button id="btnBrowse">浏览…</button>
         <button id="btnCheck">检查</button>
       </div>
-      <div class="checks" style="margin-top:8px">
-        <label><input type="checkbox" id="write_back" checked> 字幕写回音频所在文件夹</label>
-      </div>
       <div class="hint" id="dirInfo"></div>
     </div>
 
@@ -1876,9 +1900,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="card hide" id="resultCard">
     <h2>⑤ 下载</h2>
     <div class="checks" id="dlOpts">
-      <label><input type="checkbox" id="dl_ja" checked> 附带日文 lrc</label>
-      <label><input type="checkbox" id="dl_mp3"> WAV 自动转 MP3（320K）</label>
+      <label><input type="checkbox" id="dl_ja"> 附带日文 lrc</label>
+      <label><input type="checkbox" id="dl_mp3" checked> WAV 自动转 MP3（320K）</label>
       <label><input type="checkbox" id="dl_tr"> 翻译文件名</label>
+    </div>
+    <div class="row" id="wbRow">
+      <button id="btnWriteBack" disabled>字幕写回音频文件夹</button>
+      <span class="meta" id="wbInfo"></span>
     </div>
     <div class="dl" id="dl"></div>
   </div>
@@ -2219,7 +2247,6 @@ $('start').onclick = async () => {
     frequency_penalty: +$('frequency_penalty').value,
     max_tokens: +$('max_tokens').value,
     prompt_style: $('prompt_style').value,
-    write_back: $('write_back').checked,
     glossary_text: $('glossary_text').value,
     fix_text: $('fix_text').value
   };
@@ -2265,9 +2292,9 @@ async function tick(){
     Q = await (await fetch('/api/queue')).json();
   } catch(e){ setTimeout(tick, 1200); return; }
   renderQueue();
-  // 正在跑的任务换了 → 日志区切到新任务
+  // 正在跑的任务换了 → 日志区切到新任务，写回结果也清掉（那是上一个任务的）
   const cur = Q.current && Q.current.id;
-  if (cur && cur !== activeId){ activeId = cur; since = 0; $('log').textContent = ''; }
+  if (cur && cur !== activeId){ activeId = cur; since = 0; $('log').textContent = ''; wbMsg = ''; }
   if (activeId) await pollStatus(activeId);
   setTimeout(tick, 800);
 }
@@ -2396,6 +2423,8 @@ async function pollStatus(id){
 // 勾选只影响压缩包内容，所以直接拼进下载链接的查询参数，无需重跑任务。
 // 队列模式下可能有多个已完成任务，链接里要带各自的 run_id。
 let dlInfo = {has_audio: false, need_mp3: false};
+let lastStatus = null;      // 最近一次已完成任务的状态，供写回提示复用
+let wbMsg = '';             // 写回结果；非空时压过默认提示，改动选项或换任务时清掉
 
 function dlHref(kind, rid){
   const ja = $('dl_ja').checked ? 1 : 0;
@@ -2405,6 +2434,7 @@ function dlHref(kind, rid){
 }
 
 function renderDownloads(j, rid){
+  lastStatus = j;
   dlInfo = {has_audio: !!j.has_audio, need_mp3: !!j.need_mp3};
   // 没有非 MP3 音频时，「WAV 自动转 MP3」没有意义
   const mp3Box = $('dl_mp3');
@@ -2418,8 +2448,53 @@ function renderDownloads(j, rid){
     `<a data-kind="${o.kind}" data-rid="${rid || activeId}" href="${dlHref(o.kind, rid)}">`
     + `${o.label}<small>${o.est ? '约 ' : ''}${o.size || ''} · 点击下载</small></a>`).join('');
   $('resultCard').classList.toggle('hide', !outs.length);
+
+  // 写回按钮：只有「文件夹模式 + 已有字幕」才可用
+  const rid2 = rid || activeId;
+  const canWb = !!(j.src_dir && j.lrc_count && rid2);
+  $('btnWriteBack').disabled = !canWb;
+  $('btnWriteBack').dataset.rid = rid2 || '';
+  // 写回结果优先显示——否则会被每 800ms 一次的轮询重渲染冲掉，用户看不到反馈
+  $('wbInfo').textContent = wbMsg ? wbMsg
+      : (canWb ? wbText(j) : (j.src_dir ? '' : '（仅文件夹模式可用）'));
   syncDlHrefs();
 }
+
+// 写回会写几个文件，跟「附带日文 lrc」保持一致
+function wbCount(j){
+  if (!$('dl_ja').checked) return Math.max(0, (j.lrc_count || 0) - (j.lrc_ja_count || 0));
+  return j.lrc_count || 0;
+}
+function wbText(j){
+  return `将 ${wbCount(j)} 个 .lrc 复制到 ${j.src_dir}`;
+}
+
+// 字幕写回：按钮触发，不再跑任务时自动执行
+$('btnWriteBack').onclick = async () => {
+  const b = $('btnWriteBack'), rid = b.dataset.rid;
+  if (!rid) return;
+  if (!confirm(`确定把字幕写回音频文件夹？\n\n${$('wbInfo').textContent}\n\n`
+               + `只会新增 .lrc 文件，同名文件会被覆盖，不会改动或删除任何原有文件。`)) return;
+  b.disabled = true;
+  const old = b.textContent;
+  b.textContent = '写入中…';
+  try {
+    const r = await fetch('/api/write-back', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({run_id: rid, ja: $('dl_ja').checked ? 1 : 0})});
+    const j = await r.json();
+    if (!r.ok){ wbMsg = ''; $('wbInfo').textContent = '失败：' + (j.detail || r.status); return; }
+    let msg = `✓ 已写入 ${j.written}/${j.total} 个字幕`;
+    if (j.failed && j.failed.length) msg += `，${j.failed.length} 个失败`;
+    wbMsg = msg + ' → ' + j.dir;
+    $('wbInfo').textContent = wbMsg;
+  } catch(e){
+    wbMsg = '';
+    $('wbInfo').textContent = '失败：' + e;
+  } finally {
+    b.disabled = false; b.textContent = old;
+  }
+};
 
 function syncDlHrefs(){
   document.querySelectorAll('#dl a[data-kind]').forEach(a => {
@@ -2427,7 +2502,12 @@ function syncDlHrefs(){
   });
 }
 
-['dl_ja','dl_mp3','dl_tr'].forEach(id => { $(id).onchange = syncDlHrefs; });
+['dl_ja','dl_mp3','dl_tr'].forEach(id => { $(id).onchange = () => {
+  syncDlHrefs();
+  // 「附带日文 lrc」同时决定写回几个文件，提示要跟着变；写回结果也一并清掉
+  wbMsg = '';
+  if (lastStatus && $('btnWriteBack').dataset.rid) $('wbInfo').textContent = wbText(lastStatus);
+}; });
 
 // 启动队列轮询
 tick();
