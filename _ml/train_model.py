@@ -22,7 +22,7 @@ from climax_finder import (MODEL_FEATS, SR, HOP, MIN_DURATION, energy_envelope,
                            find_peaks, _smooth, model_features, load_transcript,
                            text_score_at, DEFAULT_CUES, merge_candidates,
                            snap_to_peak, snap_to_peak_by_score,
-                           MERGE_GAP, POOL_EXTRA, SNAP_WINDOW)
+                           MERGE_GAP, POOL_EXTRA, SNAP_WINDOW, MIN_PROB)
 
 TOL = 20.0
 TOPN = 3
@@ -404,7 +404,7 @@ def auc(p, rs):
             + 0.5 * (p[lb][:, None] == p[~lb][None, :]).sum()) / (lb.sum() * (~lb).sum())
 
 
-def prec_rec(p, rs, topn=TOPN, reg=None):
+def prec_rec(p, rs, topn=TOPN, reg=None, thr=0.0, iso=None):
     """按**工具实际的候选选取方式**评估。
 
     ⚠️ 这里以前是「直接取分数最高的 topn 个」，没有实现工具里的间隔抑制。
@@ -429,18 +429,27 @@ def prec_rec(p, rs, topn=TOPN, reg=None):
             continue
         gtot += len(g)
         base = merge_candidates(cand, top=topn)
-        if reg is not None:
-            events = snap_to_peak_by_score(base, cand, reg, window=SNAP_WINDOW)
+        # ⚠️ 精修分要跟着**这一轨的候选**走，不能用整折的 reg 数组 ——
+        # cand 只是 reg 的一个子集，直接传 reg 会索引错位（实测差 3 个点）
+        refs = np.array([c["_ref"] for c in cand]) if cand else np.zeros(0)
+        if refs.size:
+            events = snap_to_peak_by_score(base, cand, refs, window=SNAP_WINDOW)
         else:
             events = snap_to_peak(base, cand)
         for c in events:
+            if thr > 0 and iso is not None:
+                if float(iso.predict([c["score"]])[0]) < thr:
+                    continue
             nc += 1
             h = [x for x in g if abs(c["time"] - x) <= TOL]
             if h:
                 tp += 1
                 for x in h:
                     cov.add((rj, tk, x))
-    return tp / max(1, nc), len(cov) / max(1, gtot)
+    # 一个候选都没输出时精确率是「未定义」，返回 NaN 让调用方跳过 ——
+    # 算成 0%% 会冤枉地把平均值拉下来
+    prec = (tp / nc) if nc else float("nan")
+    return prec, len(cov) / max(1, gtot)
 
 
 # 交叉验证只在**有官方标注**的作品上做。
@@ -456,6 +465,7 @@ if extra:
 
 print("\n10 折留一作品交叉验证（给出预期成绩 + 收集样本外预测用于校准）…")
 oof_raw, oof_lab = [], []
+oof_parts = []                       # 存每折的 (raw, reg, rows)，供门槛评估复用
 A, P, R = [], [], []
 for hold in works_gt:
     tr = [r for r in rows if r["rj"] != hold]
@@ -465,9 +475,12 @@ for hold in works_gt:
     raw = ensemble(m, te)
     rg = reg_score(m, te)
     a, p, rc = auc(raw, te), *prec_rec(raw, te, reg=rg)
-    A.append(a); P.append(p); R.append(rc)
+    A.append(a); R.append(rc)
+    if not np.isnan(p):
+        P.append(p)
     oof_raw.append(raw)
     oof_lab.append(Y(te))
+    oof_parts.append((hold, raw, rg, te))
     print(f"  {hold:<12} AUC {a:.3f}  精确 {p*100:5.1f}%  召回 {rc*100:5.1f}%")
 oof_raw = np.concatenate(oof_raw)
 oof_lab = np.concatenate(oof_lab).astype(float)
@@ -481,6 +494,23 @@ br_raw = float(np.mean((oof_raw - oof_lab) ** 2))
 br_cal = float(np.mean((iso.predict(oof_raw) - oof_lab) ** 2))
 print(f"  Brier 分数：未校准 {br_raw:.4f} → 校准后 {br_cal:.4f}（改善 "
       f"{(1-br_cal/br_raw)*100:.0f}%）")
+
+# ---------------------------------------------------------------------------
+# 门槛下的指标 —— **这才是用户实际看到的数字**
+#
+# 上面那份是「不过滤」的成绩（所有合并后的事件都算）。但 WebUI 和 CLI 默认
+# 有 MIN_PROB 门槛，低分候选根本不会显示给用户。两个都报，避免误读。
+# ---------------------------------------------------------------------------
+print(f"\n输出门槛 ≥{MIN_PROB*100:.0f}% 时的指标（界面/命令行默认）…")
+Pt, Rt = [], []
+for hold, raw, rg, te in oof_parts:
+    p, rc = prec_rec(raw, te, reg=rg, thr=MIN_PROB, iso=iso)
+    Rt.append(rc)
+    if not np.isnan(p):
+        Pt.append(p)
+print(f"  {'平均':<12} 精确 {np.mean(Pt)*100:5.1f}%  召回 {np.mean(Rt)*100:5.1f}%")
+print(f"  （不过滤时是 精确 {np.mean(P)*100:.1f}% / 召回 {np.mean(R)*100:.1f}% ——"
+      f" 门槛把精确率拉高、召回率压低，这是取舍不是退步）")
 
 print("\n用全部数据训练最终模型…")
 final = fit(rows)
@@ -506,6 +536,9 @@ payload = {
         "cv_auc": float(np.nanmean(A)), "cv_auc_std": float(np.nanstd(A)),
         "cv_prec": float(np.mean(P)), "cv_prec_std": float(np.std(P)),
         "cv_rec": float(np.mean(R)),
+        # 门槛下的指标（界面/命令行默认用这两项）
+        "cv_prec_thr": float(np.mean(Pt)), "cv_rec_thr": float(np.mean(Rt)),
+        "min_prob": MIN_PROB,
         "brier_raw": br_raw, "brier_cal": br_cal,
         "train_minutes": round(sum(1 for _ in tracks) * 0),
         "built": time.strftime("%Y-%m-%d %H:%M"),
@@ -522,5 +555,9 @@ with open(OUT, "wb") as fh:
     pickle.dump(payload, fh, protocol=4)
 mb = OUT.stat().st_size / 1024 / 1024
 print(f"\n已保存 {OUT}（{mb:.1f} MB）")
-print(f"  预期成绩（10 折留一作品）：AUC {np.nanmean(A):.3f}　"
-      f"精确率 {np.mean(P)*100:.1f}%　召回率 {np.mean(R)*100:.1f}%")
+print(f"  预期成绩（10 折留一作品）")
+print(f"    门槛 ≥{MIN_PROB*100:.0f}%（实际使用）：精确率 {np.mean(Pt)*100:.1f}%　"
+      f"召回率 {np.mean(Rt)*100:.1f}%（基于 {len(Pt)}/{len(works_gt)} 折）")
+print(f"    不过滤（全输出）：          精确率 {np.mean(P)*100:.1f}%　"
+      f"召回率 {np.mean(R)*100:.1f}%（基于 {len(P)}/{len(works_gt)} 折）")
+print(f"    AUC {np.nanmean(A):.3f}")
