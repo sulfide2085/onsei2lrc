@@ -172,7 +172,10 @@ else:
 # 关键：标注必须带上它所属的**作品编号**，否则交叉验证时会把测试折的标注
 #       混进训练集 —— 那是泄漏。所以从音频路径里提取 RJ 编号。
 # ---------------------------------------------------------------------------
-FEEDBACK = ROOT / "climax_feedback.jsonl"
+# 旧 ✓/✗ 标注已弃用：标注口径不统一（用户当时不确定允许多大误差），
+# 实测加进去精确率反而从 48.9% 掉到 47.4%。文件改名保留，没有删除。
+# 加 --use-feedback 可以重新启用。
+FEEDBACK = ROOT / "climax_feedback.DEPRECATED.jsonl"
 if not _a.use_feedback:
     if FEEDBACK.exists():
         print("  旧 ✓/✗ 标注：默认不使用（加 --use-feedback 可启用）")

@@ -277,8 +277,22 @@ def api_analyze(req: AnalyzeReq, request: Request):
 def api_status():
     try:
         m = get_model()
+        try:
+            mtime = CF.MODEL_FILE.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        pend = sorted({r.get("audio", "") for r in _read_jsonl(DONE_FILE)
+                       if r.get("done", True) and r.get("audio")})
+        newer = [a for a in pend
+                 if any(r.get("audio") == a and r.get("marked_at", "")
+                        for r in _read_jsonl(MARKS_FILE))]
+        trained_at = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)) if mtime else ""
         return {"ok": True, "meta": m.meta,
-                "feedback": _feedback_stats(), "marks": _marks_stats()}
+                "feedback": _feedback_stats(), "marks": _marks_stats(),
+                "model_trained_at": trained_at,
+                "trained_works": m.meta.get("works_user_gt", []),
+                "pending_works": sorted({work_key(a) for a in newer
+                                          if work_key(a) not in m.meta.get("works_user_gt", [])})}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -687,7 +701,8 @@ button.ghost{background:transparent}
       <label class="muted">最低概率
         <select id="minp">
           <option value="0">0</option><option value="0.3">30%</option>
-          <option value="0.5">50%</option><option value="0.6">60%</option>
+          <option value="0.5" selected>50%</option><option value="0.7">70%</option>
+          <option value="0.9">90%</option>
         </select>
       </label>
       <button class="primary" id="go" disabled>分析高潮点</button>
@@ -1351,10 +1366,19 @@ fetch('/api/status').then(r => r.json()).then(d => {
   // 模型信息放进 hover 提示，不占界面
   const tip = `${m.n_works||'?'} 部作品 / ${m.n_tracks||'?'} 轨训练　`
     + `10 折 AUC ${(m.cv_auc||0).toFixed(3)}　`
-    + `精确率 ${((m.cv_prec||0)*100).toFixed(1)}%　召回率 ${((m.cv_rec||0)*100).toFixed(1)}%`;
+    + `精确率 ${((m.cv_prec||0)*100).toFixed(1)}%　召回率 ${((m.cv_rec||0)*100).toFixed(1)}%\n`
+    + `模型训练于 ${d.model_trained_at || '未知'}`;
   $('title').title = tip;
   $('pinput').title = tip;
   setStats(d.feedback);
+  // 有标完但还没进模型的作品 → 提示需要手动重训（训练不会自动发生）
+  const pend = d.pending_works || [];
+  if (pend.length){
+    $('exp').textContent = `导出标注（${pend.length} 部待训练）`;
+    $('exp').title = `你标完了 ${pend.join('、')}，但模型还是旧的。\n`
+      + '训练不会自动发生 —— 需要运行：python _ml\\train_model.py';
+    toast(`有 ${pend.length} 部作品的标注还没用于训练，跑 train_model.py 后生效`);
+  }
 });
 browse('');
 </script>
