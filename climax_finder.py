@@ -307,6 +307,9 @@ class ClimaxModel:
         with open(self.path, "rb") as fh:
             blob = pickle.load(fh)
         self.models: Dict[str, object] = blob["models"]
+        # 时间精修模型（可选；老模型文件里没有）
+        self.reg_models = {k: v for k, v in self.models.items() if k.startswith("REG_")}
+        self.clf_models = {k: v for k, v in self.models.items() if not k.startswith("REG_")}
         self.weights: List[float] = blob["weights"]
         self.iso = blob["iso"]                    # isotonic 校准器（可为 None）
         self.feat_order: List[str] = blob["feats"]
@@ -321,12 +324,19 @@ class ClimaxModel:
         return np.array([[float(f.get(k, 0.0)) for k in self.feat_order]
                          for f in feats], float)
 
+    def predict_refine(self, feats: List[Dict[str, float]]) -> Optional["np.ndarray"]:
+        """时间精修分（离真值有多近）。没有回归模型时返回 None。"""
+        if not self.reg_models or not feats:
+            return None
+        X = self._matrix(feats)
+        return np.mean([m.predict(X) for m in self.reg_models.values()], axis=0)
+
     def predict_raw(self, feats: List[Dict[str, float]]) -> "np.ndarray":
         """三等权平均的原始分（用于排序）。"""
         if not feats:
             return np.zeros(0)
         X = self._matrix(feats)
-        ps = [m.predict_proba(X)[:, 1] for m in self.models.values()]
+        ps = [m.predict_proba(X)[:, 1] for m in self.clf_models.values()]
         w = np.asarray(self.weights, float)
         w = w / w.sum()
         return np.average(ps, axis=0, weights=w)
@@ -343,7 +353,9 @@ class ClimaxModel:
 
     def describe(self) -> str:
         m = self.meta
-        names = " + ".join(f"{k}×{v:.2f}" for k, v in zip(self.models, self.weights))
+        names = " + ".join(f"{k}×{v:.2f}" for k, v in zip(self.clf_models, self.weights))
+        if self.reg_models:
+            names += "　|　时间精修：" + " + ".join(self.reg_models)
         s = [f"模型：{names}", f"特征：{len(self.feat_order)} 个"]
         if m:
             s.append(f"训练：{m.get('n_works', '?')} 部作品 / "
@@ -538,6 +550,7 @@ def snap_to_peak(events: List[dict], pool: List[dict],
     """把每个事件的时间挪到 ±window 秒内**能量最大**的峰。
 
     pool 里的候选必须带 `peak`（相对全轨中位数的 dB）。
+    这是**没有回归模型时的兜底**；有回归模型时用 snap_to_peak_by_score。
     """
     if window <= 0 or not events:
         return events
@@ -546,6 +559,34 @@ def snap_to_peak(events: List[dict], pool: List[dict],
         if not near:
             continue
         best = max(near, key=lambda c: c.get("peak", -1e9))
+        if abs(best["time"] - e["time"]) > 1e-6:
+            e["snapped_from"] = e["time"]
+            e["time"] = best["time"]
+            e["mmss"] = f"{int(best['time'])//60:02d}:{int(best['time'])%60:02d}"
+    return events
+
+
+def snap_to_peak_by_score(events: List[dict], pool: List[dict], scores: "np.ndarray",
+                          window: float = SNAP_WINDOW) -> List[dict]:
+    """用**时间精修模型**的分数在 ±window 秒内重新定位。
+
+    实测（10 折留一作品）——回归精修在每一项上都优于能量精修：
+
+        做法                    精确率   召回率   ≤5秒   平均误差
+        不精修                   49.1%   72.5%    34%    8.1 秒
+        能量精修（旧）             48.7%   70.5%    52%    6.6 秒
+        回归精修 σ=2 / ±10 秒      49.1%   72.5%    55%    6.1 秒
+
+    窗口越大时间越准、精确率越低（±15 → ≤5秒 62%，±20 → 66%）。
+    `pool[i]` 对应 `scores[i]`，两者顺序必须一致。
+    """
+    if window <= 0 or not events:
+        return events
+    for e in events:
+        idx = [i for i, c in enumerate(pool) if abs(c["time"] - e["time"]) <= window]
+        if not idx:
+            continue
+        best = pool[max(idx, key=lambda i: scores[i])]
         if abs(best["time"] - e["time"]) > 1e-6:
             e["snapped_from"] = e["time"]
             e["time"] = best["time"]
@@ -671,7 +712,9 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
             f["gap_prev"] = 0.0 if n == 0 else float((peaks[n] - peaks[n - 1]) * hop)
         raw = model_obj.predict_raw(feats)          # 排序用原始分
         prob = model_obj.predict_prob(raw)          # 显示用校准概率
-        scored = [(peaks[n] * hop, float(raw[n]), float(prob[n]), feats[n])
+        ref = model_obj.predict_refine(feats)       # 时间精修分（可为 None）
+        scored = [(peaks[n] * hop, float(raw[n]), float(prob[n]), feats[n],
+                   (float(ref[n]) if ref is not None else None))
                   for n in range(len(peaks))]
     else:
         scored = []
@@ -681,10 +724,10 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
                   - (f["recover"] - NORM["recover"]["mu"]) / NORM["recover"]["sd"])
             zt = (texts[i][0] - NORM["txt"]["mu"]) / NORM["txt"]["sd"]
             sc = W_ACOUSTIC * za + W_TXT * zt
-            scored.append((i * hop, sc, None, f))
+            scored.append((i * hop, sc, None, f, None))
 
     cands: List[dict] = []
-    for t, rawsc, prob, f in scored:
+    for t, rawsc, prob, f, rf in scored:
         i = int(round(t / hop))
         tx, tags, txt = texts.get(i, (0, [], ""))
         c = {
@@ -693,6 +736,8 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
             "score": round(rawsc, 4),               # 原始分 → 排序
             "text": txt, "semantic": tx, "cue_tags": tags,
         }
+        if rf is not None:
+            c["_ref"] = rf
         if prob is not None:
             c["probability"] = round(float(prob), 4)   # 校准概率 → 显示/阈值
             conf, why = confidence_of_prob(float(prob))
@@ -714,7 +759,14 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
         cands = [c for c in cands if c.get(key) is not None and c[key] >= min_score]
 
     picked = merge_candidates(cands, top=top, merge_gap=merge_gap, pool=pool)
-    picked = snap_to_peak(picked, cands, window=snap)
+    # 时间精修：精修分是**跟着候选走**的（过滤后仍对齐），所以直接从候选上取
+    if cands and all("_ref" in c for c in cands):
+        picked = snap_to_peak_by_score(picked, cands,
+                                       np.array([c["_ref"] for c in cands]), window=snap)
+    else:
+        picked = snap_to_peak(picked, cands, window=snap)
+    for c in picked:
+        c.pop("_ref", None)          # 内部字段不对外输出
     picked.sort(key=lambda c: -c["score"])
     res["candidates"] = picked
     res["merge_gap"] = merge_gap

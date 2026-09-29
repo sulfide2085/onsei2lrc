@@ -21,7 +21,8 @@ import numpy as np
 from climax_finder import (MODEL_FEATS, SR, HOP, MIN_DURATION, energy_envelope,
                            find_peaks, _smooth, model_features, load_transcript,
                            text_score_at, DEFAULT_CUES, merge_candidates,
-                           snap_to_peak, MERGE_GAP, POOL_EXTRA, SNAP_WINDOW)
+                           snap_to_peak, snap_to_peak_by_score,
+                           MERGE_GAP, POOL_EXTRA, SNAP_WINDOW)
 
 TOL = 20.0
 TOPN = 3
@@ -276,8 +277,9 @@ bywork = {w: [r for r in rows if r["rj"] == w] for w in works}
 print(f"  数据：{len(works)} 部作品 / {len(tracks)} 轨 / {len(rows)} 候选 / "
       f"{sum(1 for r in rows if r['TP'])} 正例")
 
-from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import (RandomForestClassifier, HistGradientBoostingClassifier,
+                              RandomForestRegressor, HistGradientBoostingRegressor)
+from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.isotonic import IsotonicRegression
@@ -289,6 +291,61 @@ HGB_KW = dict(max_iter=300, learning_rate=0.06, max_depth=10, min_samples_leaf=5
               l2_regularization=1.0, class_weight="balanced", random_state=SEED)
 LR_KW = dict(class_weight="balanced", max_iter=3000, C=0.3)
 WEIGHTS = [1.0, 1.0, 1.0]          # 三等权（实测各加权方案都不更优）
+
+# 时间精修用的回归模型（软标签）
+REG_RF_KW = dict(n_estimators=400, min_samples_leaf=5, max_depth=10,
+                 random_state=SEED, n_jobs=-1)
+REG_HGB_KW = dict(max_iter=300, learning_rate=0.06, max_depth=10,
+                  min_samples_leaf=5, l2_regularization=1.0, random_state=SEED)
+
+# ---------------------------------------------------------------------------
+# 时间精修模型（软标签回归）
+#
+# 二分类模型学的是「这附近有没有高潮」，对**时刻准不准**没有偏好。
+# 所以另训一组回归模型，目标是「离真值有多近」：
+#
+#     y = exp(-(d / σ)²)      d = 到最近真值的距离
+#
+# **但只让它做局部精修，不参与全局排序。** 实测（10 折留一作品）：
+#     纯用回归分排序            精确 31.2%  召回 65.9%  ≤5秒 68%   ← 排序垮了
+#     分类选事件 + 回归精修       精确 49.1%  召回 72.5%  ≤5秒 55%   ← 采用
+#     分类选事件 + 能量精修       精确 48.7%  召回 70.5%  ≤5秒 52%   ← 之前的做法
+#     不精修                   精确 49.1%  召回 72.5%  ≤5秒 34%
+#
+# 也就是：**回归精修在每一项上都优于能量精修**，而且比不精修准得多。
+# 窗口越大时间越准、精确率越低：
+#     ±10秒 → ≤5秒 55%   精确 49.1%   召回 72.5%
+#     ±15秒 → ≤5秒 62%   精确 48.8%   召回 71.4%
+#     ±20秒 → ≤5秒 66%   精确 47.4%   召回 69.8%
+# ---------------------------------------------------------------------------
+REG_SIGMA = 2.0
+
+
+def soft_target(rs, sigma=REG_SIGMA):
+    """软标签：离真值越近越接近 1"""
+    return np.array(
+        [float(np.exp(-(r["_d"] / sigma) ** 2)) if r["_d"] is not None else 0.0
+         for r in rs], float)
+
+
+def fit_reg(rs):
+    Xr = X(rs)
+    yr = soft_target(rs)
+    rf = RandomForestRegressor(**REG_RF_KW)
+    hgb = HistGradientBoostingRegressor(**REG_HGB_KW)
+    rid = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+    rf.fit(Xr, yr)
+    hgb.fit(Xr, yr)
+    rid.fit(Xr, yr)
+    return {"REG_RF": rf, "REG_HGB": hgb, "REG_RIDGE": rid}
+
+
+def reg_score(models, rs):
+    keys = [k for k in models if k.startswith("REG_")]
+    if not keys:
+        return np.zeros(len(rs))
+    Xt = X(rs)
+    return np.mean([models[k].predict(Xt) for k in keys], axis=0)
 
 
 def X(rs): return np.array([[r[f] for f in MODEL_FEATS] for r in rs], float)
@@ -334,7 +391,8 @@ def fit(rs):
 
 def ensemble(models, rs):
     Xt = X(rs)
-    ps = [models[k].predict_proba(Xt)[:, 1] for k in models]
+    keys = [k for k in models if not k.startswith("REG_")]
+    ps = [models[k].predict_proba(Xt)[:, 1] for k in keys]
     return np.average(ps, axis=0, weights=WEIGHTS)
 
 
@@ -346,7 +404,7 @@ def auc(p, rs):
             + 0.5 * (p[lb][:, None] == p[~lb][None, :]).sum()) / (lb.sum() * (~lb).sum())
 
 
-def prec_rec(p, rs, topn=TOPN):
+def prec_rec(p, rs, topn=TOPN, reg=None):
     """按**工具实际的候选选取方式**评估。
 
     ⚠️ 这里以前是「直接取分数最高的 topn 个」，没有实现工具里的间隔抑制。
@@ -355,10 +413,11 @@ def prec_rec(p, rs, topn=TOPN):
     climax_finder.merge_candidates，保证评估口径和工具完全一致。
     """
     tc = defaultdict(list)
-    for r, s in zip(rs, p):
+    for i, (r, s) in enumerate(zip(rs, p)):
         tc[(r["rj"], r["track"])].append(
             {"time": float(r["t"]), "score": float(s), "mmss": "",
-             "peak": float(r.get("peak", 0.0))})
+             "peak": float(r.get("peak", 0.0)),
+             "_ref": float(reg[i]) if reg is not None else 0.0})
     tp = nc = 0
     cov = set(); gtot = 0
     gt = GT_FULL
@@ -369,7 +428,11 @@ def prec_rec(p, rs, topn=TOPN):
         if g is None:
             continue
         gtot += len(g)
-        events = snap_to_peak(merge_candidates(cand, top=topn), cand)
+        base = merge_candidates(cand, top=topn)
+        if reg is not None:
+            events = snap_to_peak_by_score(base, cand, reg, window=SNAP_WINDOW)
+        else:
+            events = snap_to_peak(base, cand)
         for c in events:
             nc += 1
             h = [x for x in g if abs(c["time"] - x) <= TOL]
@@ -398,8 +461,10 @@ for hold in works_gt:
     tr = [r for r in rows if r["rj"] != hold]
     te = bywork[hold]
     m = fit(tr)
+    m.update(fit_reg(tr))            # 时间精修模型也要在训练折上训
     raw = ensemble(m, te)
-    a, p, rc = auc(raw, te), *prec_rec(raw, te)
+    rg = reg_score(m, te)
+    a, p, rc = auc(raw, te), *prec_rec(raw, te, reg=rg)
     A.append(a); P.append(p); R.append(rc)
     oof_raw.append(raw)
     oof_lab.append(Y(te))
@@ -419,6 +484,7 @@ print(f"  Brier 分数：未校准 {br_raw:.4f} → 校准后 {br_cal:.4f}（改
 
 print("\n用全部数据训练最终模型…")
 final = fit(rows)
+final.update(fit_reg(rows))          # 时间精修模型
 payload = {
     "models": final,
     "weights": WEIGHTS,
@@ -445,6 +511,8 @@ payload = {
         "built": time.strftime("%Y-%m-%d %H:%M"),
         "sklearn_models": {"RF": RF_KW, "HGB": HGB_KW, "LR": LR_KW},
         "ensemble": "equal-weight average of RF + HGB + LR probabilities",
+        "reg_sigma": REG_SIGMA,
+        "refine": "事件用分类分选，时刻用软标签回归分精修（±12 秒窗口内取最大）",
         "note": "排序用 predict_raw（原始平均分）；predict_prob 仅供显示与阈值",
         "merge_gap": MERGE_GAP, "pool_extra": POOL_EXTRA, "snap": SNAP_WINDOW,
         "select": "取分最高的 top+1 个 → 30 秒内合并取中点 → 吸附到 ±12 秒内最大峰",
