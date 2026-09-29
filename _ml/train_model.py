@@ -99,6 +99,46 @@ else:
                      encoding="utf-8")
     print(f"  完成，用时 {time.time()-t0:.0f}s")
 
+# ---------------------------------------------------------------------------
+# 合并人工标注（播放器里标的对错）
+#
+# 关键：标注必须带上它所属的**作品编号**，否则交叉验证时会把测试折的标注
+#       混进训练集 —— 那是泄漏。所以从音频路径里提取 RJ 编号。
+# ---------------------------------------------------------------------------
+FEEDBACK = ROOT / "climax_feedback.jsonl"
+if FEEDBACK.exists():
+    import re as _re
+    latest = {}
+    for line in FEEDBACK.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        latest[(r.get("audio"), round(r.get("time", 0), 1))] = r
+    added, skipped = 0, 0
+    have = {(r["rj"], r["track"], round(r["t"], 1)) for r in rows}
+    for (audio, _), r in latest.items():
+        if r.get("verdict") not in (0, 1) or not r.get("feats"):
+            continue
+        m = _re.search(r"(RJ\d+)", str(audio))
+        if not m:
+            skipped += 1
+            continue
+        rj = m.group(1)
+        row = {k: float(r["feats"].get(k, 0.0)) for k in MODEL_FEATS}
+        row["TP"] = bool(r["verdict"])
+        row["has_gt"] = True
+        row["rj"] = rj
+        row["track"] = "user"
+        row["t"] = float(r["time"])
+        row["txt"] = float(r["feats"].get("txt", 0.0))
+        rows.append(row)
+        added += 1
+    print(f"  合并人工标注：{added} 条" + (f"（{skipped} 条路径里没有 RJ 编号，跳过）" if skipped else ""))
+
 for r in rows:
     for k in MODEL_FEATS:
         v = r.get(k, 0.0)

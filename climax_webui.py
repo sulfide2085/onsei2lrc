@@ -33,6 +33,10 @@ BROWSE_TTL = 45.0
 BROWSE_CACHE: Dict[str, Any] = {}
 BROWSE_LOCK = threading.Lock()
 
+# 人工标注落盘（追加式 JSONL，不入库）
+FEEDBACK_FILE = ROOT / "climax_feedback.jsonl"
+FEEDBACK_LOCK = threading.Lock()
+
 app = FastAPI(title="climax player")
 
 # ---------------------------------------------------------------------------
@@ -209,9 +213,13 @@ def api_analyze(req: AnalyzeReq, request: Request):
         prob = float(c.get("probability", 0.0))
         if prob < req.min_prob:
             continue
+        # 带上 21 个模型特征：人工标注落盘时要一起存，
+        # 否则音频一旦移动/改名，标好的数据就没法用于训练了。
+        feats = {k: round(float(c.get(k, 0.0)), 4) for k in CF.MODEL_FEATS}
         cands.append({"time": c["time"], "mmss": c["mmss"], "prob": round(prob, 4),
-                      "conf": c["confidence"], "text": c.get("text", ""),
-                      "note": c.get("confidence_note", "")})
+                      "raw": c["score"], "conf": c["confidence"],
+                      "text": c.get("text", ""), "note": c.get("confidence_note", ""),
+                      "feats": feats})
     return {"ok": True, "duration": round(res.get("duration", 0), 2),
             "candidates": cands, "has_climax": res.get("has_climax"),
             "max_prob": res.get("max_prob"), "elapsed": round(time.time() - t0, 1),
@@ -223,9 +231,103 @@ def api_analyze(req: AnalyzeReq, request: Request):
 def api_status():
     try:
         m = get_model()
-        return {"ok": True, "meta": m.meta}
+        return {"ok": True, "meta": m.meta,
+                "feedback": _feedback_stats()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# 人工标注（听的时候标对错，用于后续继续训练）
+# ---------------------------------------------------------------------------
+class FeedbackReq(BaseModel):
+    audio: str
+    time: float
+    mmss: str = ""
+    prob: float = 0.0
+    raw: float = 0.0
+    text: str = ""
+    verdict: Optional[int] = None      # 1=真是高潮, 0=不是, None=撤销
+    feats: Dict[str, float] = {}
+
+
+def _read_feedback() -> List[dict]:
+    if not FEEDBACK_FILE.exists():
+        return []
+    out = []
+    for line in FEEDBACK_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _feedback_stats() -> Dict[str, int]:
+    rows = _read_feedback()
+    latest: Dict[tuple, int] = {}
+    for r in rows:                     # 后来的覆盖先前的
+        latest[(r.get("audio"), round(r.get("time", 0), 1))] = r.get("verdict", 0)
+    pos = sum(1 for v in latest.values() if v == 1)
+    return {"total": len(latest), "pos": pos, "neg": len(latest) - pos}
+
+
+@app.get("/api/feedback")
+def api_feedback(audio: str = ""):
+    """返回某个音频上已有的标注（用于刷新页面后恢复状态）。"""
+    rows = _read_feedback()
+    latest: Dict[str, int] = {}
+    for r in rows:
+        if audio and r.get("audio") != audio:
+            continue
+        latest[f"{r.get('time', 0):.1f}"] = r.get("verdict", 0)
+    return {"ok": True, "verdicts": latest, "stats": _feedback_stats()}
+
+
+@app.post("/api/feedback")
+def api_feedback_post(req: FeedbackReq):
+    if req.verdict not in (0, 1, None):
+        raise HTTPException(400, "verdict 只能是 0 / 1 / null")
+    rec = {
+        "audio": req.audio,
+        "name": Path(req.audio).name,
+        "time": round(float(req.time), 2),
+        "mmss": req.mmss,
+        "prob": round(float(req.prob), 4),
+        "raw": round(float(req.raw), 4),
+        "text": req.text[:120],
+        "verdict": req.verdict,
+        "feats": {k: float(req.feats.get(k, 0.0)) for k in CF.MODEL_FEATS},
+        "marked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with FEEDBACK_LOCK:
+        with open(FEEDBACK_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return {"ok": True, "stats": _feedback_stats()}
+
+
+@app.get("/api/feedback/export")
+def api_feedback_export():
+    """导出训练用的 {features, label} 表（后来的标注覆盖先前的）。"""
+    rows = _read_feedback()
+    latest: Dict[tuple, dict] = {}
+    for r in rows:
+        latest[(r.get("audio"), round(r.get("time", 0), 1))] = r
+    out = []
+    for (audio, _), r in latest.items():
+        if r.get("verdict") not in (0, 1):
+            continue
+        if not r.get("feats"):
+            continue
+        out.append({"audio": audio, "time": r["time"], "label": int(r["verdict"]),
+                    "prob": r.get("prob"), "text": r.get("text", ""),
+                    "feats": r["feats"]})
+    return JSONResponse({"count": len(out),
+                         "pos": sum(1 for x in out if x["label"] == 1),
+                         "rows": out})
 
 
 # ===========================================================================
@@ -333,6 +435,18 @@ button.ghost{background:transparent}
 .hit .x{flex:1;color:var(--dim);font-size:12px;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .hit.hi .p{color:var(--hot)} .hit.mid .p{color:var(--warn)} .hit.lo .p{color:var(--dim)}
+.hit .vb{display:flex;gap:4px;flex:none}
+.hit .vb button{padding:2px 9px;font-size:13px;line-height:1.5;border-radius:6px;
+  background:transparent;border:1px solid var(--line);color:var(--dim)}
+.hit .vb button:hover{background:#2c333e;color:var(--fg)}
+.hit .vb button.y.on{background:#1c5c42;border-color:var(--ok);color:#8ff0c4}
+.hit .vb button.n.on{background:#5c1c28;border-color:var(--hot);color:#ffb3c0}
+.hit.marked-y{border-left:3px solid var(--ok)}
+.hit.marked-n{border-left:3px solid var(--hot);opacity:.62}
+.hit.marked-n .t{text-decoration:line-through;color:var(--dim)}
+#fbstats{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+#fbstats b{color:var(--ok);font-weight:600}
+#fbstats i{color:var(--hot);font-style:normal;font-weight:600}
 
 /* 歌词 */
 #lyr{max-height:230px;overflow:auto;font-size:13px;line-height:1.85}
@@ -389,6 +503,8 @@ button.ghost{background:transparent}
       </label>
       <button class="primary" id="go" disabled>分析高潮点</button>
       <button id="clr" disabled title="清除已导入的歌词">清除歌词</button>
+      <span id="fbstats"></span>
+      <button id="exp" class="ghost" title="导出标注，用于继续训练模型">导出标注</button>
       <span id="err"></span>
     </div>
 
@@ -546,10 +662,25 @@ function pick(path, name){
   toast('已选择：' + name);
 }
 
-clr.onclick = () => {
+$('clr').onclick = () => {
   pickedLrc = ''; lyr = []; lyrIdx = -1;
-  lyrcard.style.display = 'none';
+  $('lyrcard').style.display = 'none';
   toast('已清除导入的歌词');
+};
+
+$('exp').onclick = async () => {
+  try{
+    const r = await fetch('/api/feedback/export');
+    const d = await r.json();
+    if (!d.count){ toast('还没有标注可导出', 'err'); return; }
+    const blob = new Blob([JSON.stringify(d, null, 1)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'climax_feedback.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast(`已导出 ${d.count} 条（${d.pos} 真 / ${d.count - d.pos} 假）`);
+  }catch(e){ toast('导出失败：' + e.message, 'err'); }
 };
 
 /* ---------- 分析 ---------- */
@@ -566,10 +697,11 @@ $('go').onclick = async () => {
     });
     const d = await r.json();
     if (!d.ok){ $('err').textContent = d.error || '分析失败'; toast(d.error || '分析失败','err'); return; }
-    cands = (d.candidates||[]).map(c => ({...c, fired:false, warned:false}));
+    cands = (d.candidates||[]).map(c => ({...c, fired:false, warned:false, verdict:null}));
     $('meta').textContent = `　${fmt(d.duration)}　${cands.length} 个候选　`
       + `耗时 ${d.elapsed}s` + (d.has_climax === false ? '　（可能没有高潮）' : '');
     renderHits();
+    await loadVerdicts();
     drawMarkers();
     await loadLrc(pickedLrc || d.lrc);
     if (!cands.length) toast('没有达到概率门槛的候选');
@@ -592,10 +724,71 @@ function renderHits(){
     el.title = c.note || '';
     el.innerHTML = `<span class="t">${c.mmss}</span>`
       + `<span class="p">${Math.round(c.prob*100)}%</span>`
-      + `<span class="x">${esc(c.text || '')}</span>`;
-    el.onclick = () => { au.currentTime = Math.max(0, c.time - 2); au.play(); };
+      + `<span class="x">${esc(c.text || '')}</span>`
+      + `<span class="vb">`
+      +   `<button class="y" data-v="1" title="确认是高潮">✓</button>`
+      +   `<button class="n" data-v="0" title="不是高潮">✗</button>`
+      + `</span>`;
+    el.onclick = e => {
+      if (e.target.closest('.vb')) return;      // 点按钮不算跳转
+      au.currentTime = Math.max(0, c.time - 2); au.play();
+    };
+    el.querySelectorAll('.vb button').forEach(b => {
+      b.onclick = e => { e.stopPropagation(); mark(c, +b.dataset.v); };
+    });
     box.appendChild(el);
+    paintVerdict(c);
   }
+}
+
+/* ---------- 人工标注 ---------- */
+function paintVerdict(c){
+  const el = [...document.querySelectorAll('.hit')]
+    .find(h => Math.abs(+h.dataset.t - c.time) < 1e-6);
+  if (!el) return;
+  el.classList.toggle('marked-y', c.verdict === 1);
+  el.classList.toggle('marked-n', c.verdict === 0);
+  el.querySelector('.vb .y').classList.toggle('on', c.verdict === 1);
+  el.querySelector('.vb .n').classList.toggle('on', c.verdict === 0);
+}
+
+function setStats(s){
+  if (!s) return;
+  $('fbstats').innerHTML = s.total
+    ? `已标 ${s.total} 条（<b>${s.pos}</b> 真 / <i>${s.neg}</i> 假）`
+    : '';
+}
+
+async function mark(c, v){
+  c.verdict = (c.verdict === v) ? null : v;      // 再点一次 = 撤销
+  paintVerdict(c);
+  try{
+    const r = await fetch('/api/feedback', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({audio: cur, time: c.time, mmss: c.mmss,
+                            prob: c.prob, raw: c.raw, text: c.text,
+                            verdict: c.verdict, feats: c.feats || {}})
+    });
+    const d = await r.json();
+    setStats(d.stats);
+    if (c.verdict === 1) toast(`${c.mmss} 标为高潮`);
+    else if (c.verdict === 0) toast(`${c.mmss} 标为不是`);
+    else toast('已撤销标注');
+  }catch(e){ toast('标注保存失败：' + e.message, 'err'); }
+}
+
+async function loadVerdicts(){
+  if (!cur) return;
+  try{
+    const r = await fetch('/api/feedback?audio=' + encodeURIComponent(cur));
+    const d = await r.json();
+    setStats(d.stats);
+    for (const c of cands){
+      const v = d.verdicts[`${c.time.toFixed(1)}`];
+      c.verdict = (v === 0 || v === 1) ? v : null;
+      paintVerdict(c);
+    }
+  }catch(e){}
 }
 
 async function loadLrc(fullOrName){
