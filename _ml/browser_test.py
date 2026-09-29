@@ -44,8 +44,8 @@ with sync_playwright() as pw:
     print("=" * 84)
     pg.goto(BASE, wait_until="networkidle")
     pg.wait_for_timeout(1200)
-    ck("页面标题", pg.title() == "高潮点播放器", pg.title())
-    ck("模型信息已显示", "AUC" in pg.inner_text("#ver"), pg.inner_text("#ver")[:40])
+    ck("窗口标题为空（不取名）", pg.title() == "", repr(pg.title()))
+    ck("路径输入框存在", pg.locator("#pinput").count() == 1)
     ck("无 JS 报错", not errors, "; ".join(errors[:2]))
 
     print()
@@ -54,6 +54,7 @@ with sync_playwright() as pw:
     print("=" * 84)
     ck("根级列出驱动器", pg.locator("#listing .row.dir").count() >= 2,
        f"{pg.locator('#listing .row.dir').count()} 个")
+    ck("根级有分组标题", pg.locator("#listing .secn").count() >= 1)
     # 直接跳到音频目录
     pg.evaluate("p => browse(p)", AUDIO_DIR)
     pg.wait_for_timeout(900)
@@ -70,6 +71,7 @@ with sync_playwright() as pw:
     row.click()
     pg.wait_for_timeout(1500)
     ck("标题显示文件名", AUDIO_NAME[:10] in pg.inner_text("#title"))
+    ck("窗口标题变成文件名", pg.title() == AUDIO_NAME, pg.title()[:30])
     ck("播放按钮已启用", pg.locator("#pp").is_enabled())
     dur = pg.evaluate("au.duration")
     ck("音频已加载（时长>0）", dur and dur > 60, f"{dur:.0f}s" if dur else "无")

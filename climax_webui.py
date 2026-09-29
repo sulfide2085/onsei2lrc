@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""climax_webui —— 高潮点播放器
+"""climax_webui —— 本地音频播放器（带高潮点提示与人工标注）
 
 本地音频播放器：选文件 → 生成高潮点 → 播放时提示。
 
@@ -58,15 +58,21 @@ def get_model() -> "CF.ClimaxModel":
 # ---------------------------------------------------------------------------
 # 目录浏览
 # ---------------------------------------------------------------------------
-def _count_audio(root: Path, cap: int = 4000, budget: float = 0.35) -> int:
-    """有上限地数音频文件，避免在盘符根目录（如 C:\\）上卡住。"""
-    n, t0 = 0, time.time()
+def _quick_count(d: Path) -> int:
+    """只数**直接子文件**里的音频 —— 一次 iterdir，约 0 ms。
+
+    以前这里做递归 rglob，还要给每个子目录 0.35 秒预算：
+    D:\\ 有 8 个子目录就累积到 12.9 秒，完全不可用。
+    实测 iterdir 任何目录都是 0~2 ms，所以只用它。
+    """
+    n = 0
     try:
-        for i, p in enumerate(root.rglob("*")):
-            if time.time() - t0 > budget or n >= cap:
-                break
-            if p.is_file() and p.suffix.lower() in CF.AUDIO_EXTS:
-                n += 1
+        for e in d.iterdir():
+            try:
+                if e.is_file() and e.suffix.lower() in CF.AUDIO_EXTS:
+                    n += 1
+            except OSError:
+                continue
     except (PermissionError, OSError):
         pass
     return n
@@ -109,8 +115,15 @@ def api_browse(path: str = ""):
                 if e.is_dir():
                     if e.name.startswith(".") or e.name in ("$RECYCLE.BIN", "System Volume Information"):
                         continue
+                    n = _quick_count(e)                    # 只数直接子文件
+                    has_sub = False
+                    if n == 0:                             # 空的才多看一眼有没有下级目录
+                        try:
+                            has_sub = any(x.is_dir() for x in e.iterdir())
+                        except OSError:
+                            pass
                     dirs.append({"name": e.name, "path": str(e),
-                                 "audio": _count_audio(e)})
+                                 "audio": n, "has_sub": has_sub})
                 elif e.is_file():
                     sfx = e.suffix.lower()
                     if sfx in CF.AUDIO_EXTS:
@@ -339,7 +352,7 @@ PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🎧</text></svg>">
-<title>高潮点播放器</title>
+<title></title>
 <style>
 :root{
   --bg:#0e1013; --panel:#16191f; --panel2:#1d2128; --line:#272c35;
@@ -364,21 +377,27 @@ button.ghost{background:transparent}
 
 /* 左侧文件浏览 */
 #side{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
-#side h1{margin:0;padding:14px 16px;font-size:15px;font-weight:600;
-  border-bottom:1px solid var(--line);letter-spacing:.4px}
-#side h1 span{color:var(--dim);font-weight:400;font-size:12px;margin-left:8px}
-#crumbs{padding:8px 12px;border-bottom:1px solid var(--line);display:flex;gap:6px;
-  align-items:center;font-size:12px;color:var(--dim);min-height:34px}
-#crumbs b{color:var(--fg);font-weight:500}
+#pick{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;gap:6px}
+#pinput{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);
+  border-radius:7px;padding:6px 10px;font-size:12px;outline:none}
+#pinput:focus{border-color:var(--accent)}
+#pinput::placeholder{color:#5f6878}
+#crumbs{padding:7px 12px;border-bottom:1px solid var(--line);display:flex;gap:6px;
+  align-items:center;font-size:12px;color:var(--dim);min-height:32px}
+#crumbs b{color:var(--fg);font-weight:500;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;direction:rtl;text-align:left}
 #listing{flex:1;overflow:auto;padding:4px 0}
+#listing.busy{opacity:.45}
 .row{display:flex;align-items:center;gap:8px;padding:5px 14px;cursor:pointer;
   white-space:nowrap;font-size:13px}
 .row:hover{background:var(--panel2)}
 .row.sel{background:#1b3a5c}
 .row .nm{overflow:hidden;text-overflow:ellipsis;flex:1}
-.row .mt{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+.row .mt{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums;flex:none}
 .row.dir .nm{color:#b9c6da}
 .row.lrc .nm{color:#8fd4b0}
+.row .hint{color:#4d5563;font-size:11px;flex:none}
+.secn{padding:9px 14px 3px;font-size:11px;color:#5f6878;letter-spacing:.6px}
 .empty{padding:20px 16px;color:var(--dim);font-size:12px}
 
 /* 右侧播放器 */
@@ -484,7 +503,9 @@ button.ghost{background:transparent}
 <body>
 <div id="app">
   <aside id="side">
-    <h1>高潮点播放器<span id="ver"></span></h1>
+    <div id="pick">
+      <input id="pinput" spellcheck="false" placeholder="输入或粘贴路径，回车打开">
+    </div>
     <div id="crumbs">位置</div>
     <div id="listing"></div>
   </aside>
@@ -550,7 +571,8 @@ button.ghost{background:transparent}
 const $ = id => document.getElementById(id);
 const au = $('au');
 let cur = null;              // 当前音频路径
-let cands = [];              // [{time,mmss,prob,conf,text,note,fired,warned}]
+let curPath = '';            // 当前浏览的目录
+let cands = [];              // [{time,mmss,prob,conf,text,note,fired,warned,verdict}]
 let lyr = [];                // [{time,text}]
 let pickedLrc = '';          // 用户手动导入的歌词路径
 let lyrIdx = -1;
@@ -592,53 +614,106 @@ function beep(kind){
 }
 
 /* ---------- 文件浏览 ---------- */
+const RECENT_KEY = 'climax_recent';
+const getRecent = () => { try{ return JSON.parse(localStorage.getItem(RECENT_KEY)||'[]'); }catch(e){ return []; } };
+function pushRecent(p){
+  if (!p) return;
+  let r = getRecent().filter(x => x !== p);
+  r.unshift(p);
+  try{ localStorage.setItem(RECENT_KEY, JSON.stringify(r.slice(0, 8))); }catch(e){}
+}
+
+let browseSeq = 0;
 async function browse(path){
+  const seq = ++browseSeq;
+  const L = $('listing');
+  L.classList.add('busy');
+  if (!L.querySelector('.row')) L.innerHTML = '<div class="empty">读取中…</div>';
+
   let d;
   try{
     const r = await fetch('/api/browse?path=' + encodeURIComponent(path||''));
     if (!r.ok) throw new Error((await r.json()).detail || r.status);
     d = await r.json();
-  }catch(e){ toast('无法读取目录：' + e.message, 'err'); return; }
+  }catch(e){
+    L.classList.remove('busy');
+    toast('无法读取目录：' + e.message, 'err');
+    return;
+  }
+  if (seq !== browseSeq) return;          // 已经有更新的请求了，丢弃本次
+  curPath = d.path || '';
 
   $('crumbs').innerHTML = d.path
-    ? `<button class="ghost" id="up">↑</button><b>${esc(d.path)}</b>`
+    ? `<button class="ghost" id="up" title="上一级">↑</button><b>${esc(d.path)}</b>`
     : '<b>此电脑</b>';
-  if (d.path) $('up').onclick = () => browse(d.parent);
+  if (d.path){
+    $('up').onclick = () => browse(d.parent);
+    $('pinput').value = d.path;
+    pushRecent(d.path);
+  } else {
+    $('pinput').value = '';
+  }
 
-  const L = $('listing');
   L.innerHTML = '';
+  if (!d.path){
+    const r = getRecent();
+    if (r.length){
+      L.appendChild(secn('最近'));
+      for (const p of r) L.appendChild(dirRow(p.split('\\').filter(Boolean).pop() || p, p, null, false, true));
+    }
+    L.appendChild(secn('位置'));
+  }
   for (const x of d.dirs){
-    const el = document.createElement('div');
-    el.className = 'row dir';
-    el.innerHTML = `<span class="nm">📁 ${esc(x.name)}</span>`
-      + (x.audio ? `<span class="mt">${x.audio}</span>` : '');
-    el.onclick = () => browse(x.path);
-    L.appendChild(el);
+    L.appendChild(dirRow(x.name, x.path, x.audio, x.has_sub, false));
   }
   for (const x of d.audio){
     const el = document.createElement('div');
     el.className = 'row' + (x.path === cur ? ' sel' : '');
     el.dataset.path = x.path;
+    el.title = x.path;
     el.innerHTML = `<span class="nm">♪ ${esc(x.name)}</span>`
       + `<span class="mt">${(x.size/1048576).toFixed(1)}M</span>`;
     el.onclick = () => pick(x.path, x.name);
     L.appendChild(el);
   }
-  for (const x of (d.lrcs || [])){
-    const el = document.createElement('div');
-    el.className = 'row lrc';
-    el.innerHTML = `<span class="nm">💬 ${esc(x.name)}</span>`;
-    el.title = cur ? '设为本音频的歌词' : '先选择一个音频文件';
-    el.onclick = () => {
-      if (!cur){ toast('先选择音频文件', 'err'); return; }
-      useLrc(x.path, x.name);
-    };
-    L.appendChild(el);
+  if ((d.lrcs||[]).length){
+    L.appendChild(secn('歌词'));
+    for (const x of d.lrcs){
+      const el = document.createElement('div');
+      el.className = 'row lrc';
+      el.title = cur ? '设为本音频的歌词' : '先选择一个音频文件';
+      el.innerHTML = `<span class="nm">💬 ${esc(x.name)}</span>`;
+      el.onclick = () => {
+        if (!cur){ toast('先选择音频文件', 'err'); return; }
+        useLrc(x.path, x.name);
+      };
+      L.appendChild(el);
+    }
   }
-  if (!d.dirs.length && !d.audio.length && !(d.lrcs||[]).length){
+  if (!d.dirs.length && !d.audio.length && !(d.lrcs||[]).length && d.path){
     L.innerHTML = '<div class="empty">此目录没有子目录或音频文件</div>';
   }
+  L.classList.remove('busy');
+  L.scrollTop = 0;
 }
+
+function secn(t){
+  const e = document.createElement('div'); e.className = 'secn'; e.textContent = t; return e;
+}
+
+function dirRow(name, path, n, hasSub, recent){
+  const el = document.createElement('div');
+  el.className = 'row dir';
+  el.dataset.path = path;
+  el.title = path;
+  const badge = (n === null || n === undefined) ? ''
+    : (n > 0 ? `<span class="mt">${n}</span>`
+             : (hasSub ? '<span class="hint">›</span>' : ''));
+  el.innerHTML = `<span class="nm">${recent ? '🕘' : '📁'} ${esc(name)}</span>${badge}`;
+  el.onclick = () => browse(path);
+  return el;
+}
+
 const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
@@ -649,6 +724,7 @@ function pick(path, name){
   const e = document.querySelector(`.row[data-path="${CSS.escape(path)}"]`);
   if (e) e.classList.add('sel');
 
+  document.title = name;
   $('title').innerHTML = esc(name) + ' <small id="meta"></small>';
   au.src = '/api/audio?path=' + encodeURIComponent(path);
   au.load();
@@ -974,15 +1050,28 @@ function syncLyrics(t){
 }
 
 /* ---------- 启动 ---------- */
-$('flash').classList.remove('on');
+$('pinput').onkeydown = e => {
+  if (e.key !== 'Enter') return;
+  const v = $('pinput').value.trim().replace(/^"|"$/g, '');
+  if (!v){ browse(''); return; }
+  browse(v);
+};
+$('pinput').onblur = () => { if (!curPath) $('pinput').value = ''; };
+
 fetch('/api/status').then(r => r.json()).then(d => {
-  if (d.ok){
-    const m = d.meta || {};
-    $('ver').textContent = `${m.n_works||'?'}部作品训练　10折 AUC ${(m.cv_auc||0).toFixed(3)}`;
-  } else {
-    $('ver').textContent = '模型未就绪';
-    $('err').textContent = d.error || '';
+  if (!d.ok){
+    $('err').textContent = d.error || '模型未就绪';
+    return;
   }
+  const m = d.meta || {};
+  document.title = '';
+  // 模型信息放进 hover 提示，不占界面
+  const tip = `${m.n_works||'?'} 部作品 / ${m.n_tracks||'?'} 轨训练　`
+    + `10 折 AUC ${(m.cv_auc||0).toFixed(3)}　`
+    + `精确率 ${((m.cv_prec||0)*100).toFixed(1)}%　召回率 ${((m.cv_rec||0)*100).toFixed(1)}%`;
+  $('title').title = tip;
+  $('pinput').title = tip;
+  setStats(d.feedback);
 });
 browse('');
 </script>
@@ -997,14 +1086,14 @@ def index():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="高潮点播放器")
+    ap = argparse.ArgumentParser(description="本地音频播放器")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7861)
     ap.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
     a = ap.parse_args()
 
     print("=" * 66)
-    print("  高潮点播放器")
+    print("  本地音频播放器（高潮点提示 + 人工标注）")
     print(f"  http://{a.host}:{a.port}")
     try:
         m = get_model()
