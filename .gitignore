@@ -46,6 +46,7 @@ _probe*
 _srv.*
 _smoke/
 _diag*/
+_climax*/
 _resume*/
 
 # ---- 个人术语表（内容取决于素材，不入库；模板见 glossary_template.txt）----
