@@ -50,6 +50,33 @@ SR = 16000              # 解码采样率
 HOP = 0.05              # 帧步长（秒）
 WIN = 0.10              # 帧长（秒）
 
+# ======================================================================================
+# 置信度标定：把分数映射成经验精确率
+#
+# 在 15 轨 / 67 个候选上实测（9 轨有高潮、6 轨没有，标注点来自两部作品的 readme）：
+#     分数 <  +2.5  →  经验精确率  0% ~ 12%   （基本是噪声）
+#     分数 >= +2.5  →  经验精确率 54% ~ 64%   （可用）
+# 门槛非常清晰，所以下面就按这条线分档。
+# ======================================================================================
+CONF_HIGH = 2.5         # 高于此分：实测精确率 54~64%
+CONF_MID = 1.5          # 1.5~2.5：实测 7~12%
+# 低于 CONF_MID：实测 0%
+
+# 轨级判断：整轨最高分低于此值 → 提示「这一轨可能没有高潮」
+# 实测（排除 <1 分钟的短轨后）轨级准确率 92%
+TRACK_MIN_SCORE = 2.3
+# 短于此时长的轨，特征不稳定（实测 5 秒的标题轨能拿到 +3.90 分），直接跳过
+MIN_DURATION = 60.0
+
+
+def confidence_of(score: float) -> Tuple[str, str]:
+    """分数 → (档位, 经验精确率说明)。精确率数字来自实测标定。"""
+    if score >= CONF_HIGH:
+        return "高", "实测精确率 54~64%"
+    if score >= CONF_MID:
+        return "中", "实测精确率 7~12%"
+    return "低", "实测精确率 0%"
+
 
 # ======================================================================================
 # 语义线索
@@ -237,12 +264,16 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
 # ======================================================================================
 def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
                   acoustic_only: bool = False, verbose: bool = True,
-                  transcript_dirs: Optional[List[Path]] = None) -> dict:
-    """分析单个音频，返回候选点。不抛异常——失败信息放在结果的 error 字段。"""
+                  transcript_dirs: Optional[List[Path]] = None,
+                  min_score: Optional[float] = None) -> dict:
+    """分析单个音频，返回候选点。不抛异常——失败信息放在结果的 error 字段。
+
+    min_score: 只保留分数不低于此值的候选。None = 不过滤（默认，全部输出但标置信度）。
+    """
     cues = cues or DEFAULT_CUES
     t0 = time.time()
     res: Dict = {"audio": str(audio), "name": audio.name, "candidates": [],
-                 "transcript": False, "error": ""}
+                 "transcript": False, "error": "", "has_climax": None}
     try:
         x = decode_audio_mono(audio)
     except Exception as e:
@@ -255,6 +286,14 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
     segs = None if acoustic_only else load_transcript(audio, transcript_dirs)
     res["transcript"] = segs is not None
     res["duration"] = len(x) / SR
+
+    # 极短轨的特征不稳定（实测 5 秒的标题轨能拿到 +3.90 分，比多数真高潮还高），直接跳过
+    if res["duration"] < MIN_DURATION:
+        res["error"] = (f"时长 {res['duration']:.0f} 秒，短于 {MIN_DURATION:.0f} 秒阈值——"
+                        f"短轨的能量特征不稳定，跳过（这类轨通常也没有高潮段）")
+        if verbose:
+            _print_one(res)
+        return res
 
     db, hop = energy_envelope(x)
     s = _smooth(db, int(0.3 / hop))
@@ -269,14 +308,20 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
         za = ((f["signature"] - NORM["signature"]["mu"]) / NORM["signature"]["sd"]
               - (f["recover"] - NORM["recover"]["mu"]) / NORM["recover"]["sd"])
         zt = (tx - NORM["txt"]["mu"]) / NORM["txt"]["sd"]
+        sc = W_ACOUSTIC * za + W_TXT * zt
+        conf, why = confidence_of(sc)
         cands.append({
             "time": round(t, 2),
             "mmss": f"{int(t)//60:02d}:{int(t)%60:02d}",
-            "score": round(W_ACOUSTIC * za + W_TXT * zt, 3),
+            "score": round(sc, 3),
+            "confidence": conf, "confidence_note": why,
             "acoustic": round(za, 3), "semantic": tx, "cue_tags": tags,
             "text": txt,
             **{k: round(v, 2) for k, v in f.items()},
         })
+
+    if min_score is not None:
+        cands = [c for c in cands if c["score"] >= min_score]
 
     # 最小间隔再抑制一次（Top-N 之间至少隔 15 秒）
     cands.sort(key=lambda c: -c["score"])
@@ -287,6 +332,9 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
         if len(picked) >= top:
             break
     res["candidates"] = picked
+    # 轨级判断：整轨最高分低于阈值 → 这一轨大概率没有高潮
+    res["max_score"] = round(picked[0]["score"], 3) if picked else None
+    res["has_climax"] = bool(picked and picked[0]["score"] >= TRACK_MIN_SCORE)
     res["elapsed"] = round(time.time() - t0, 1)
     if verbose:
         _print_one(res)
@@ -296,7 +344,7 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
 def _print_one(res: dict) -> None:
     name = res["name"]
     if res.get("error"):
-        print(f"\n  【{name}】✗ {res['error']}")
+        print(f"\n  【{name}】跳过：{res['error']}")
         return
     dur = res.get("duration", 0)
     src = "声学+语义" if res["transcript"] else "纯声学（无转写）"
@@ -304,12 +352,20 @@ def _print_one(res: dict) -> None:
     print(f"  {name}   {dur/60:.1f} 分钟   [{src}]   {res.get('elapsed', 0)}s")
     print(f"{'=' * 78}")
     if not res["candidates"]:
-        print("    （没有找到候选点）")
+        print("    （没有候选点）")
         return
+
+    mx = res.get("max_score")
+    if res.get("has_climax") is False:
+        print(f"  ⚠ 这一轨可能**没有高潮**：最高分 {mx:+.2f} 低于阈值 {TRACK_MIN_SCORE:+.2f}")
+        print(f"    （该阈值在 15 轨上实测轨级准确率 92%，但负样本只有 6 轨，样本很小）")
+        print()
+
     for i, c in enumerate(res["candidates"], 1):
         tags = "，".join(c["cue_tags"]) if c["cue_tags"] else "无文本线索"
         print(f"  #{i}  [{c['mmss']}]  分数 {c['score']:+6.2f}   "
-              f"声学 {c['acoustic']:+5.2f}  文本 {c['semantic']:+d}（{tags}）")
+              f"置信度 {c['confidence']}（{c['confidence_note']}）")
+        print(f"        声学 {c['acoustic']:+5.2f} · 文本 {c['semantic']:+d}（{tags}）")
         print(f"        形状: 前平台 {c['pre30']:+6.1f} dB · 峰值 {c['peak']:+6.1f} dB · "
               f"释放后 {c['post4']:+6.1f} dB · 脱力 {c['recover']:.1f}s")
         if c["text"]:
@@ -350,6 +406,8 @@ def _cli() -> int:
     ap.add_argument("--json", help="把结果写到 JSON")
     ap.add_argument("--acoustic-only", action="store_true", help="只用声学，不读转写")
     ap.add_argument("--cues", help="自定义线索规则文件（每行一个正则，# 开头为注释）")
+    ap.add_argument("-m", "--min-score", type=float, default=None,
+                    help=f"只输出分数不低于此值的候选（实测 {CONF_HIGH:+.1f} 以上精确率 54~64%%；不加则全输出并标置信度）")
     ap.add_argument("--transcript-dir", "--asr-dir", action="append", default=[],
                     dest="transcript_dir", metavar="DIR",
                     help="转写文件所在目录（可重复；默认只在音频旁边找）")
@@ -375,16 +433,19 @@ def _cli() -> int:
     print("=" * 78)
     print("  climax_finder —— 高潮候选点检测")
     print(f"  评分 = {W_ACOUSTIC} × 声学(signature, recover) + {W_TXT} × 语义")
+    print(f"  置信度门槛 {CONF_HIGH:+.1f}（以上实测精确率 54~64%）　"
+          f"轨级门槛 {TRACK_MIN_SCORE:+.1f}　最短时长 {MIN_DURATION:.0f}s")
     print("=" * 78)
 
     tdirs = [Path(d).expanduser() for d in a.transcript_dir]
     kw = dict(top=a.top, cues=cues, acoustic_only=a.acoustic_only,
-              verbose=not a.quiet, transcript_dirs=tdirs or None)
+              verbose=not a.quiet, transcript_dirs=tdirs or None,
+              min_score=a.min_score)
     results = find_in_path(target, **kw)
 
     if not a.quiet:
         print("=" * 78)
-        print("  提示：这是候选生成器，精确率约 53%，请人工确认后再使用")
+        print("  提示：这是候选生成器，请按「置信度」人工确认后再使用")
         print("=" * 78)
     if a.json:
         Path(a.json).write_text(json.dumps(results, ensure_ascii=False, indent=1),
