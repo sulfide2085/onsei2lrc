@@ -29,6 +29,9 @@ starlette                # FastAPI 的依赖
 # 模型（首次运行会自动从 HuggingFace 下载）
 # ============================================================================
 #   ASR    quantumcookie/anime-whisper-ct2-int8     约 732 MB   MIT
-#   翻译   由 LM Studio / llama.cpp / Ollama 提供，需自行下载：
-#            Sakura-GalTransl-7B-v3.7   约 6.25 GB (Q6_K)   CC BY-NC-SA 4.0
-#            Sakura-7B-Qwen2.5-v1.0     约 3.96 GB (IQ4_XS) CC BY-NC-SA 4.0
+#   翻译   由 LM Studio / llama.cpp / Ollama 提供，需自行下载。可选：
+#            sakura-galtransl-7b-v3.7   6.25 GB  Qwen2 7B  (默认，配 --prompt-style v3)
+#            galtransl-v4-4b-2601       3.31 GB  Qwen3 4B  (配 --prompt-style v3)
+#            sakura-7b-qwen2.5-v1.0     4.25 GB  Qwen2 7B  (上一代，配 --prompt-style v1)
+#          三者均为 CC BY-NC-SA 4.0，禁止商用。
+#          注意：提示词模板与采样参数按代际配套，不可混用。

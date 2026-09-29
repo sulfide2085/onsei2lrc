@@ -276,20 +276,24 @@ python onsei2lrc.py "音频目录" --retranslate --reuse-translation ^
 ```bat
 cd onsei2lrc
 
-:: 1) 启动本地翻译模型（LM Studio，Sakura-7B-Qwen2.5-v1.0）
+:: 1) 启动本地翻译模型（LM Studio，Sakura-GalTransl-7B-v3.7）
 lms server start --port 1234
-lms load sakura-7b-qwen2.5-v1.0 --gpu max --context-length 4096 --identifier sakura
+lms load sakura-galtransl-7b-v3.7 --gpu max --context-length 8192 --identifier sakura37
 
 :: 2) 转写 + 翻译 + 出 LRC（目录批处理）
 python onsei2lrc.py "D:\音声\RJ00000000" ^
-    --preset lmstudio --model-name sakura --lrc-mode zh --outdir out
+    --preset lmstudio --model-name sakura37 --prompt-style v3 --lrc-mode zh --outdir out
 
 :: 想要双语（同一时间戳两行：日文在上、中文在下）
-python onsei2lrc.py "音频或目录" --preset lmstudio --model-name sakura --lrc-mode both --outdir out
+python onsei2lrc.py "音频或目录" --preset lmstudio --model-name sakura37 --prompt-style v3 --lrc-mode both --outdir out
 
 :: 想直接写在音频旁边（注意别覆盖已有同名文件）
-python onsei2lrc.py "D:\音声\RJ00000000" --preset lmstudio --model-name sakura --lrc-mode zh
+python onsei2lrc.py "D:\音声\RJ00000000" --preset lmstudio --model-name sakura37 --prompt-style v3 --lrc-mode zh
 ```
+
+> `--model-name` 填的是**服务里的实例标识符**，不是模型文件名。
+> LM Studio 由 `lms load ... --identifier` 决定，llama.cpp server 用 `--alias`。
+> 填错了会连不上，或悄悄走到另一个模型上。
 
 `--lrc-mode`：`zh` 只要中文 / `both` 中日双语 / `ja` 只要日文（当听写用）/ `inline` 一行内用 `｜` 分隔。
 
@@ -345,13 +349,44 @@ python onsei2lrc.py 音频 --retranslate
 | `energy` | 78.8% | 1.36s |
 | **`hybrid`** | **87.6%** | **0.95s** |
 
-## 3. 翻译：Sakura（日中专用）+ 官方 prompt
+## 3. 翻译：Sakura / GalTransl（日中专用）
 
-`Sakura-7B-Qwen2.5-v1.0`（IQ4_XS 量化版约 3.96 GB，8G 显存可跑）：
-基于 Qwen2.5 在轻小说/galgame 中日语料上继续预训练+微调，**专攻日→中**，口语化文本处理自然。
+### 默认用哪个
 
-用的是 Sakura 官方 README 的 v1.0 prompt（多行输入、按行对齐输出），解码参数
-`temperature=0.1, top_p=0.3`，退化时 `frequency_penalty=0.15`：
+**`Sakura-GalTransl-7B-v3.7`**（6.25 GB，LM Studio 里的 `sakura-galtransl-7b-v3.7`）：
+
+```bat
+lms load sakura-galtransl-7b-v3.7 --gpu max --context-length 8192 --identifier sakura37
+
+python onsei2lrc.py "音频目录" --preset lmstudio --model-name sakura37 --prompt-style v3 ...
+```
+
+配套参数：`temperature=0.3, top_p=0.8, frequency_penalty=0.0`（`--prompt-style v3` 会自动带上）。
+
+### 可选的其它模型
+
+| 模型 | 体积 | 架构 | 提示词模板 | 采样参数 | 说明 |
+|---|---|---|---|---|---|
+| **`sakura-galtransl-7b-v3.7`** | 6.25 GB | Qwen2 7B | **`v3`** | 0.3 / 0.8 / 0.0 | **默认**，视觉小说风格，译文更贴口语 |
+| `galtransl-v4-4b-2601` | 3.31 GB | Qwen3 4B | `v3` | 0.3 / 0.8 / 0.0 | 更小更快，显存紧张时用 |
+| `sakura-7b-qwen2.5-v1.0` | 4.25 GB | Qwen2 7B | **`v1`** | 0.1 / 0.3 / 0.15 | 上一代，轻小说风格 |
+
+> ⚠️ **两代模型的 prompt 与采样参数不可混用**：给 v3.7 喂 v1.0 的 prompt（或反过来）
+> 会明显掉质量。`--prompt-style` 就是用来切换这一整套的，选错模板比选错模型影响更大。
+
+### 两套 prompt 长什么样
+
+**v3（GalTransl，默认）** —— 视觉小说风格：
+
+```
+system: 你是一个视觉小说翻译模型，可以通顺地使用给定的术语表以指定的风格将日文翻译成简体中文，
+        并联系上下文正确使用人称代词，注意不要混淆使役态和被动态的主语和宾语，
+        不要擅自添加原文中没有的特殊符号，也不要擅自增加或减少换行。
+user:   根据以上术语表的对应关系和备注，结合历史剧情和上下文，将下面的文本从日文翻译成简体中文：
+        <第1行>\n<第2行>\n…
+```
+
+**v1（Sakura v1.0）** —— 轻小说风格：
 
 ```
 system: 你是一个轻小说翻译模型，可以流畅通顺地以日本轻小说的风格将日文翻译成简体中文，
@@ -359,16 +394,18 @@ system: 你是一个轻小说翻译模型，可以流畅通顺地以日本轻小
 user:   将下面的日文文本翻译成中文：<第1行>\n<第2行>\n…
 ```
 
+两段都是**模型作者发布的官方 prompt**，本工具只是原样使用（见 `onsei2lrc.py` 的 `PROMPT_STYLES`）。
+
 多行批量是 Sakura 的原生能力，默认一次 8 行（`--batch-size`）。若返回行数与输入不一致，
 先**拆半重试**（保留上下文），再退化到逐行——实测 87 分钟素材里只有几批触发。
 
 ### 翻译后端
 
-| 后端 | 命令 |
-|---|---|
-| LM Studio（本机现成） | `--preset lmstudio --model-name sakura` |
-| llama.cpp server | `--preset sakura-llamacpp` |
-| Ollama | `--preset sakura-ollama` |
+| | 后端 | 命令 |
+|---|---|---|
+| LM Studio（本机现成） | `--preset lmstudio --model-name sakura37 --prompt-style v3` |
+| llama.cpp server | `--preset sakura-llamacpp --model-name <你的 alias>` |
+| Ollama | `--preset sakura-ollama --model-name <你的模型名>` |
 | DeepSeek API | `set DEEPSEEK_API_KEY=sk-xxx` 后 `--preset deepseek` |
 
 > ⚠️ **建议优先用本地模型**：云端 API（DeepSeek / OpenAI / Gemini）都有内容审核策略，
@@ -471,8 +508,10 @@ WAV 反而略快（读 PCM + 重采样 vs 熵解码）。**真正有差别的是
 | 环节 | 速度 |
 |---|---|
 | anime-whisper CT2 int8 转写 | 12~30x 实时（取决于切块密度） |
-| Sakura-7B IQ4_XS 翻译 | 约 2~4 行/秒 |
+| Sakura-GalTransl-7B-v3.7 翻译 | 约 2~4 行/秒 |
 | **7 轨全流程（87 分钟音频，849 行输出）** | **12.6 分钟**（其中 ASR ≈ 7 分钟，翻译 ≈ 6 分钟） |
+
+显存占用（RTX 4060 Laptop 8G）：ASR ≈ 1.0 GB，翻译模型 6.25 GB，两者同时驻留约 7.4 GB。
 
 ## 8. 依赖与许可
 
