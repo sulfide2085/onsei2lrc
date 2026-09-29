@@ -114,19 +114,26 @@ def _win(arr: np.ndarray, hop: float, i: int, a: float, b: float) -> np.ndarray:
     return arr[lo:hi]
 
 
-def find_peaks(arr: np.ndarray, hop: float, min_gap: float = 15.0,
-               top: int = 8) -> List[int]:
-    """局部极大值，按高度排序后做最小间隔抑制。"""
-    gap = int(min_gap / hop)
+def find_peaks(arr: np.ndarray, hop: float, min_gap: float = 8.0,
+               pct: float = 95.0) -> List[int]:
+    """候选池：全轨 95 分位以上的局部极大值，再做最小间隔抑制。
+
+    早期版本用「固定取前 12 个峰」，在样本外测试里崩了——
+    某些音轨（如 RJ362169 的 track06）后半段挤满极响的音效，
+    固定名额被占满，真高潮（全轨 99.8% 分位）反而进不了候选池，
+    后面的评分再准也没用。
+    改用分位数阈值后不再依赖「一轨里最多有几个响点」，自适应。
+    """
+    if len(arr) < 3:
+        return []
+    thr = float(np.percentile(arr, pct))
+    gap = max(1, int(min_gap / hop))
     idx = [i for i in range(1, len(arr) - 1)
-           if arr[i] >= arr[i - 1] and arr[i] > arr[i + 1]]
-    idx.sort(key=lambda i: -arr[i])
+           if arr[i] >= arr[i - 1] and arr[i] > arr[i + 1] and arr[i] >= thr]
     kept: List[int] = []
-    for i in idx:
+    for i in sorted(idx, key=lambda j: -arr[j]):
         if all(abs(i - j) > gap for j in kept):
             kept.append(i)
-        if len(kept) >= top:
-            break
     return kept
 
 
@@ -254,7 +261,7 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
     med = float(np.median(s))
 
     cands = []
-    for i in find_peaks(s, hop, min_gap=15.0, top=max(top * 3, 12)):
+    for i in find_peaks(s, hop):
         t = i * hop
         f = acoustic_features(x, med, i, s, hop)
         tx, tags, txt = (text_score_at(segs, t, cues) if segs else (0, [], ""))
