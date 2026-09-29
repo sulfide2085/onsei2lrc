@@ -209,18 +209,34 @@ def collect_audio(root: Path) -> List[Path]:
                   if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
 
 
-def count_audio_bounded(root: Path, cap: int = 30000) -> int:
-    """有上限的递归计数，避免在 C:\\ 这种大目录上卡死。"""
+def count_audio_bounded(root: Path, cap: int = 30000, budget: float = 0.45) -> int:
+    """有上限的递归音频计数。
+
+    双上限：既限制遍历条目数，也限制**耗时**。只限条目数是不够的——
+    实测在 C:\\ 上遍历 3 万个条目就要 5 秒，整个接口被拖到不可用。
+    这里每 256 个条目检查一次时间，超预算就停（返回的是下界，但对「这个文件夹
+    里有没有音频」这个用途足够了）。
+    """
     n = 0
+    t0 = time.time()
     try:
         for i, p in enumerate(root.rglob("*")):
             if i > cap:
+                break
+            if (i & 255) == 0 and time.time() - t0 > budget:
                 break
             if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
                 n += 1
     except (PermissionError, OSError):
         pass
     return n
+
+
+# 目录浏览结果缓存：来回点同一层时不必重复扫盘。
+# key = 路径，value = (写入时间, 结果)。TTL 短一点，避免用户新建文件夹后看不到。
+_BROWSE_CACHE: Dict[str, tuple] = {}
+_BROWSE_TTL = 45.0
+_BROWSE_LOCK = threading.Lock()
 
 
 def list_drives() -> List[str]:
@@ -237,11 +253,31 @@ def list_drives() -> List[str]:
 
 
 def browse_dir(raw: str) -> dict:
-    """列出盘符或某目录下的子目录（含各自的音频文件数）。"""
+    """列出盘符或某目录下的子目录（含各自的音频文件数）。结果带缓存。"""
+    key = raw.strip()
+    now = time.time()
+    with _BROWSE_LOCK:
+        hit = _BROWSE_CACHE.get(key)
+        if hit and now - hit[0] < _BROWSE_TTL:
+            return hit[1]
+
+    res = _browse_dir_uncached(raw)
+
+    with _BROWSE_LOCK:
+        _BROWSE_CACHE[key] = (now, res)
+        if len(_BROWSE_CACHE) > 512:                 # 简单的容量控制
+            for k in sorted(_BROWSE_CACHE, key=lambda k: _BROWSE_CACHE[k][0])[:128]:
+                _BROWSE_CACHE.pop(k, None)
+    return res
+
+
+def _browse_dir_uncached(raw: str) -> dict:
     if not raw.strip():
         dirs = []
         for d in list_drives():
-            dirs.append({"name": d, "path": d, "audio": count_audio_bounded(Path(d), 3000)})
+            # 盘符的递归计数最贵（等于扫整个盘），预算给得更紧
+            dirs.append({"name": d, "path": d,
+                         "audio": count_audio_bounded(Path(d), 4000, 0.30)})
         return {"path": "", "parent": "", "is_root": True, "dirs": dirs,
                 "audio": 0, "audio_recursive": 0, "exists": True}
 
@@ -2219,8 +2255,10 @@ $('cancel').onclick = async () => {
 // ===== 任务队列 =====
 // 一个文件夹 = 一个任务。任务由服务端串行执行，前端只负责展示与增删。
 // 日志/进度区跟随「当前正在跑的任务」；没有在跑时跟随最后完成的任务。
-let Q = {pending: [], current: null, done: []};
-let activeId = null, since = 0;
+// 注意：since 已在上面声明过（let runId = null, since = 0），这里不能再声明一次
+// ——同一作用域重复 let 会让整个 <script> 解析失败，所有按钮一起失效。
+let Q = {pending: [], current: null, finished: []};
+let activeId = null;
 
 async function tick(){
   try {
