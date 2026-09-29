@@ -30,7 +30,7 @@ for hold in works:
         by[r["track"]].append(r)
     for tk, grp in by.items():
         gts = GT.get(hold, {}).get(tk)
-        if not gts:
+        if gts is None:      # 空列表（0 次的音轨）也要评估
             continue
         grp.sort(key=lambda x: -x["_s"])
         picks = merge_candidates(

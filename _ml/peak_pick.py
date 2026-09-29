@@ -31,7 +31,7 @@ for hold in works:
         by[r["track"]].append(r)
     for tk, grp in by.items():
         gts = GT.get(hold, {}).get(tk)
-        if not gts:
+        if gts is None:      # 空列表（0 次的音轨）也要评估
             continue
         for g in gts:
             # 真值 ±15 秒内的所有峰
@@ -92,7 +92,7 @@ for hold in works:
         by[r["track"]].append(r)
     for tk, grp in by.items():
         gts = GT.get(hold, {}).get(tk)
-        if not gts:
+        if gts is None:      # 空列表（0 次的音轨）也要评估
             continue
         for g in gts:
             w = [r for r in grp if abs(r["t"] - g) <= 15.0]

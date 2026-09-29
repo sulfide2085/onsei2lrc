@@ -31,12 +31,63 @@ OUT = ROOT / "climax_model.pkl"
 ASR_EXTRA = {"RJ324692": ROOT / "_climax" / "asr", "RJ362169": ROOT / "_climax2" / "asr"}
 ASR_ML = ROOT / "_ml" / "asr"
 
+MARKS = ROOT / "climax_marks.jsonl"          # 手动标注的精确高潮时刻
+DONE = ROOT / "climax_tracks_done.jsonl"     # 「本轨已标完」确认
+
+
+def _jsonl(path: Path):
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def load_user_gt():
+    """用户手动标注 → ({rj: {track: [秒]}}, {rj: {track: 音频路径}})，只含**已标完**的音轨。
+
+    为什么必须「标完」才能用：一轨若有 3 次高潮只标了 2 次，
+    第 3 次附近的候选就会被当成负例 —— **比不标还糟**。
+    """
+    import re
+    done = {r["audio"] for r in _jsonl(DONE)
+            if r.get("done", True) and r.get("audio")}
+    live = {}
+    for r in _jsonl(MARKS):
+        a = r.get("audio", "")
+        if not a or a not in done:
+            continue
+        d = live.setdefault(a, {"add": set(), "del": set()})
+        d["add" if r.get("action", "add") == "add" else "del"].add(
+            round(float(r.get("time", 0)), 2))
+    out, files = {}, {}
+    for a, d in live.items():
+        m = re.search(r"(RJ\d+)", a)
+        tm = re.search(r"track[_\-\s]*(\d+)", Path(a).name, re.I)
+        if not m or not tm:
+            continue
+        rj, tk = m.group(1), tm.group(1).zfill(2)
+        out.setdefault(rj, {})[tk] = sorted(d["add"] - d["del"])
+        files.setdefault(rj, {})[tk] = a
+    return out, files
+
 
 def build_dataset():
     """用 climax_finder 的规范特征函数提取全部候选"""
     from faster_whisper import decode_audio
     meta = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))
     GT, FILES = meta["gt"], meta["files"]
+    # 用户手动标注的（已标完）音轨也要提特征 —— 它们可能不在原来 10 部里
+    u_gt, u_files = load_user_gt()
+    for rj, trks in u_gt.items():
+        for tk, fp in u_files[rj].items():
+            GT.setdefault(rj, {})[tk] = trks[tk]
+            FILES.setdefault(rj, {})[tk] = fp
     rows, tracks = [], []
     for rj in sorted(GT):
         asrdir = ASR_EXTRA.get(rj, ASR_ML / rj)
@@ -88,6 +139,21 @@ def build_dataset():
     return rows, tracks
 
 
+# 距离加权的带宽。定义在命令行解析**之前** ——
+# 之前写在解析之后，把 --dist-weight 的值又覆盖回 0 了（三个 σ 结果完全相同才发现）
+DIST_SIGMA = 0.0
+
+import argparse as _ap
+_p = _ap.ArgumentParser()
+_p.add_argument("--dist-weight", type=float, default=0.0, metavar="SIGMA",
+                help="按到真值的距离给正例加权 exp(-(d/σ)²)；0=关闭（默认）")
+_p.add_argument("--use-feedback", action="store_true",
+                help="额外使用旧的 ✓/✗ 标注。默认**不用**：实测加上去精确率反而从 "
+                     "48.9%% 掉到 47.4%%（虽然只差 3 个候选，属于噪声，但没有收益）")
+_a = _p.parse_args()
+if _a.dist_weight > 0:
+    DIST_SIGMA = _a.dist_weight
+
 if CACHE.exists():
     print(f"复用已提取的特征：{CACHE}")
     blob = json.loads(CACHE.read_text(encoding="utf-8"))
@@ -107,7 +173,10 @@ else:
 #       混进训练集 —— 那是泄漏。所以从音频路径里提取 RJ 编号。
 # ---------------------------------------------------------------------------
 FEEDBACK = ROOT / "climax_feedback.jsonl"
-if FEEDBACK.exists():
+if not _a.use_feedback:
+    if FEEDBACK.exists():
+        print("  旧 ✓/✗ 标注：默认不使用（加 --use-feedback 可启用）")
+elif FEEDBACK.exists():
     import re as _re
     latest = {}
     for line in FEEDBACK.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -134,6 +203,7 @@ if FEEDBACK.exists():
         row["has_gt"] = True
         row["rj"] = rj
         row["track"] = "user"
+        row["src"] = "feedback"     # 来源标记：与官方标注区分开
         row["t"] = float(r["time"])
         row["txt"] = float(r["feats"].get("txt", 0.0))
         rows.append(row)
@@ -144,7 +214,61 @@ for r in rows:
     for k in MODEL_FEATS:
         v = r.get(k, 0.0)
         r[k] = float(v) if np.isfinite(v) else 0.0
+
+# ---------------------------------------------------------------------------
+# 官方标注 + 用户手动标注（已标完的），用户标注**覆盖**官方
+#
+# 为什么要区分来源：官方标注是出版方给的精确时刻（实测误差约 1 秒）；
+# 用户手动标注是听出来的，精度取决于耳力，但**覆盖了模型漏掉的高潮**——
+# 这是 ✓/✗ 式标注永远做不到的。
+# ---------------------------------------------------------------------------
+USER_GT, USER_FILES = load_user_gt()
+_official = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
+GT_FULL = {rj: {tk: list(v) for tk, v in trks.items()} for rj, trks in _official.items()}
+overridden = []
+for rj, trks in USER_GT.items():
+    for tk, times in trks.items():
+        if rj in GT_FULL and tk in GT_FULL[rj]:
+            overridden.append(f"{rj}/{tk}")
+        GT_FULL.setdefault(rj, {})[tk] = list(times)
+
+
+def row_dist(r):
+    """这一行到最近真值的距离（秒）；没有真值返回 None。"""
+    g = GT_FULL.get(r["rj"], {}).get(r["track"])
+    if not g:
+        return None
+    return min(abs(r["t"] - x) for x in g)
+
+
+# 用户标注的行需要重算 TP（features 缓存里存的是按官方标注算的）
+recomputed = 0
+for r in rows:
+    r.setdefault("src", "official")
+    g = GT_FULL.get(r["rj"], {}).get(r["track"])
+    if g is None:
+        r["_d"] = None
+        continue
+    new_tp = any(abs(r["t"] - x) <= TOL for x in g)
+    if new_tp != r["TP"]:
+        recomputed += 1
+    r["TP"] = new_tp
+    r["_d"] = row_dist(r)
+
 works = sorted({r["rj"] for r in rows})
+
+if USER_GT:
+    n_ut = sum(len(v) for v in USER_GT.values())
+    n_up = sum(len(x) for v in USER_GT.values() for x in v.values())
+    print(f"  用户手动标注：{len(USER_GT)} 部 / {n_ut} 轨（已标完）/ {n_up} 个点")
+    if overridden:
+        print(f"    覆盖了官方标注：{', '.join(overridden[:6])}"
+              + (" …" if len(overridden) > 6 else ""))
+    if recomputed:
+        print(f"    重算了 {recomputed} 行的正负标签")
+else:
+    print("  用户手动标注：无（播放器里标完并勾选「本轨已标完」后才有）")
+
 bywork = {w: [r for r in rows if r["rj"] == w] for w in works}
 print(f"  数据：{len(works)} 部作品 / {len(tracks)} 轨 / {len(rows)} 候选 / "
       f"{sum(1 for r in rows if r['TP'])} 正例")
@@ -168,13 +292,41 @@ def X(rs): return np.array([[r[f] for f in MODEL_FEATS] for r in rs], float)
 def Y(rs): return np.array([r["TP"] for r in rs], int)
 
 
+# ---------------------------------------------------------------------------
+# 时间误差得分（命令行 --dist-weight SIGMA 开启）
+#
+# 现状：真值 ±20 秒内的**所有**峰都算正例，模型没有动力区分哪个最准。
+# 开启后正例按距离加权：w = exp(-(d/σ)²)，越准的峰权重越高。
+#
+# 实测（σ=5，且只有官方标注时）：≤5 秒 35% → 43%，但精确率掉 3 个点；
+# 更激进的硬标注（只有最近峰算正例）把 AUC 从 0.916 打到 0.858。
+# **所以默认关闭**（σ=0）。等手动精确标注足够多之后再重新评估 ——
+# 那时「距离」是听出来的，比官方标注更贴近真实感知。
+# ---------------------------------------------------------------------------
+def make_weights(rs):
+    if DIST_SIGMA <= 0:
+        return None
+    w = np.ones(len(rs))
+    for i, r in enumerate(rs):
+        if not r["TP"]:
+            continue
+        d = r.get("_d")
+        if d is not None:
+            w[i] = float(np.exp(-(d / DIST_SIGMA) ** 2))
+    return w
+
+
 def fit(rs):
     Xr, yr = X(rs), Y(rs)
-    return {
-        "RF": RandomForestClassifier(**RF_KW).fit(Xr, yr),
-        "HGB": HistGradientBoostingClassifier(**HGB_KW).fit(Xr, yr),
-        "LR": make_pipeline(StandardScaler(), LogisticRegression(**LR_KW)).fit(Xr, yr),
-    }
+    sw = make_weights(rs)
+    rf = RandomForestClassifier(**RF_KW)
+    hgb = HistGradientBoostingClassifier(**HGB_KW)
+    lr = make_pipeline(StandardScaler(), LogisticRegression(**LR_KW))
+    rf.fit(Xr, yr, sample_weight=sw)
+    hgb.fit(Xr, yr, sample_weight=sw)
+    # Pipeline 不收裸的 sample_weight，要用 stepname__参数 的形式
+    lr.fit(Xr, yr, logisticregression__sample_weight=sw)
+    return {"RF": rf, "HGB": hgb, "LR": lr}
 
 
 def ensemble(models, rs):
@@ -206,7 +358,7 @@ def prec_rec(p, rs, topn=TOPN):
              "peak": float(r.get("peak", 0.0))})
     tp = nc = 0
     cov = set(); gtot = 0
-    gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
+    gt = GT_FULL
     for (rj, tk), cand in tc.items():
         # 人工标注可能来自没有官方标注的作品 —— 那种没有评估基准，跳过。
         # （它们仍然参与训练，只是不能用来算精确率/召回率。）
@@ -228,7 +380,7 @@ def prec_rec(p, rs, topn=TOPN):
 # 交叉验证只在**有官方标注**的作品上做。
 # 人工标注的作品没有完整标注（用户只标了模型给出的候选），算不了召回率，
 # 拿它当测试折没有意义 —— 所以它们始终留在训练集里。
-_gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
+_gt = GT_FULL
 works_gt = [w for w in works if w in _gt and any(r["track"] in _gt[w] for r in bywork[w])]
 extra = [w for w in works if w not in works_gt]
 if extra:
@@ -273,6 +425,15 @@ payload = {
         "n_works": len(works_gt), "n_tracks": len(tracks), "n_rows": len(rows),
         "n_pos": sum(1 for r in rows if r["TP"]),
         "works": works_gt, "works_extra": extra,
+        "works_official": sorted(w for w in works_gt if w in _official),
+        "works_user_gt": sorted(USER_GT),
+        "user_gt_points": sum(len(x) for v in USER_GT.values() for x in v.values()),
+        "dist_sigma": DIST_SIGMA,
+        "label_sources": {
+            "official": sum(1 for r in rows if r.get("src") == "official"),
+            "feedback": sum(1 for r in rows if r.get("src") == "feedback"),
+        },
+        "use_feedback": bool(_a.use_feedback),
         "cv_auc": float(np.nanmean(A)), "cv_auc_std": float(np.nanstd(A)),
         "cv_prec": float(np.mean(P)), "cv_prec_std": float(np.std(P)),
         "cv_rec": float(np.mean(R)),

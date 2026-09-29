@@ -34,8 +34,27 @@ BROWSE_CACHE: Dict[str, Any] = {}
 BROWSE_LOCK = threading.Lock()
 
 # 人工标注落盘（追加式 JSONL，不入库）
-FEEDBACK_FILE = ROOT / "climax_feedback.jsonl"
+FEEDBACK_FILE = ROOT / "climax_feedback.jsonl"      # ✓/✗ 判定（旧方式）
+MARKS_FILE = ROOT / "climax_marks.jsonl"            # 精确高潮时刻（新方式）
+DONE_FILE = ROOT / "climax_tracks_done.jsonl"       # 「本轨已标完」标记
 FEEDBACK_LOCK = threading.Lock()
+
+
+def track_key(name: str) -> str:
+    """从文件名提取音轨编号，与官方标注的键一致（track04_xxx → "04"）。"""
+    import re
+    m = re.search(r"track[_\-\s]*(\d+)", name, re.I)
+    if m:
+        return m.group(1).zfill(2)
+    m = re.search(r"(\d+)", name)
+    return m.group(1).zfill(2) if m else ""
+
+
+def work_key(path: str) -> str:
+    """从路径提取作品编号（RJxxxxxxxx）。"""
+    import re
+    m = re.search(r"(RJ\d+)", str(path))
+    return m.group(1) if m else ""
 
 app = FastAPI(title="climax player")
 
@@ -259,7 +278,7 @@ def api_status():
     try:
         m = get_model()
         return {"ok": True, "meta": m.meta,
-                "feedback": _feedback_stats()}
+                "feedback": _feedback_stats(), "marks": _marks_stats()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -357,6 +376,134 @@ def api_feedback_export():
                          "rows": out})
 
 
+# ---------------------------------------------------------------------------
+# 精确高潮时刻标注
+#
+# 比 ✓/✗ 好在三点：
+#   1. 不依赖模型候选 —— 模型**漏掉**的高潮也能标出来（这是 ✓/✗ 永远做不到的）
+#   2. 记录的是精确时刻，可以直接算时间误差
+#   3. 标完的音轨可以直接当官方标注用，成为可评估的测试折
+#
+# 但有个前提：**只有标完的音轨才能当标注用**。
+# 如果一轨有 3 次高潮只标了 2 次，第 3 次附近的候选就会被当成负例 ——
+# 那比不标还糟。所以要有「本轨已标完」这个显式确认。
+# ---------------------------------------------------------------------------
+class MarkReq(BaseModel):
+    audio: str
+    time: Optional[float] = None       # 秒；删除时用
+    action: str = "add"                # add | del | done | undone
+    note: str = ""
+
+
+def _read_jsonl(path: Path) -> List[dict]:
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def _marks_of(audio: str) -> List[float]:
+    """某音频上现存的精确标注时刻（去重、排序）。"""
+    live, dead = set(), set()
+    for r in _read_jsonl(MARKS_FILE):
+        if r.get("audio") != audio:
+            continue
+        t = round(float(r.get("time", 0)), 2)
+        (live if r.get("action", "add") == "add" else dead).add(t)
+    return sorted(live - dead)
+
+
+def _done_of(audio: str) -> bool:
+    v = False
+    for r in _read_jsonl(DONE_FILE):
+        if r.get("audio") == audio:
+            v = bool(r.get("done", True))
+    return v
+
+
+@app.get("/api/marks")
+def api_marks(audio: str = ""):
+    """返回某音频的精确标注 + 一批统计。"""
+    if audio:
+        return {"ok": True, "times": _marks_of(audio), "done": _done_of(audio),
+                "track": track_key(Path(audio).name), "work": work_key(audio)}
+    # 不带参数时返回全部（供导出/概览）
+    byfile: Dict[str, List[float]] = {}
+    for r in _read_jsonl(MARKS_FILE):
+        a = r.get("audio", "")
+        if a:
+            byfile.setdefault(a, [])
+    return {"ok": True,
+            "files": {a: {"times": _marks_of(a), "done": _done_of(a)}
+                      for a in byfile}}
+
+
+@app.post("/api/marks")
+def api_marks_post(req: MarkReq):
+    audio = req.audio
+    if not audio:
+        raise HTTPException(400, "缺少 audio")
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    with FEEDBACK_LOCK:
+        if req.action in ("add", "del"):
+            if req.time is None:
+                raise HTTPException(400, "add/del 需要 time")
+            rec = {"audio": audio, "time": round(float(req.time), 2),
+                   "action": req.action, "note": req.note[:80], "marked_at": now}
+            with open(MARKS_FILE, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        elif req.action in ("done", "undone"):
+            rec = {"audio": audio, "done": req.action == "done", "marked_at": now}
+            with open(DONE_FILE, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        else:
+            raise HTTPException(400, f"未知 action：{req.action}")
+    return {"ok": True, "times": _marks_of(audio), "done": _done_of(audio),
+            "stats": _marks_stats()}
+
+
+def _marks_stats() -> Dict[str, int]:
+    """全局统计：多少音轨标完、共多少个点。"""
+    files = {a for a in (_r.get("audio", "") for _r in _read_jsonl(MARKS_FILE)) if a}
+    done = {a for a in (_r.get("audio", "") for _r in _read_jsonl(DONE_FILE)) if a
+            and _done_of(a)}
+    return {"tracks_marked": len(files), "tracks_done": len(done),
+            "points": sum(len(_marks_of(a)) for a in files)}
+
+
+@app.get("/api/marks/export")
+def api_marks_export():
+    """导出成和 gt_all.json 同构的格式，可直接给 train_model.py 用。
+
+    只导出**已标完**的音轨 —— 没标完的会让模型把漏标的高潮学成负例。
+    """
+    files = {r.get("audio", "") for r in _read_jsonl(MARKS_FILE) if r.get("audio")}
+    gt: Dict[str, Dict[str, List[float]]] = {}
+    skipped = []
+    for a in sorted(files):
+        if not _done_of(a):
+            skipped.append(a)
+            continue
+        rj, tk = work_key(a), track_key(Path(a).name)
+        if not rj or not tk:
+            skipped.append(a)
+            continue
+        gt.setdefault(rj, {})[tk] = _marks_of(a)
+    return {"works": len(gt), "tracks": sum(len(v) for v in gt.values()),
+            "points": sum(len(x) for v in gt.values() for x in v.values()),
+            "skipped_incomplete": len(skipped), "gt": gt,
+            "files": {a: {"work": work_key(a), "track": track_key(Path(a).name)}
+                      for a in sorted(files)}}
+
+
 # ===========================================================================
 # 前端
 # ===========================================================================
@@ -436,6 +583,11 @@ button.ghost{background:transparent}
 .mk.mid{background:var(--warn)}
 .mk.lo{background:#5c6472}
 .mk.done{opacity:.3}
+/* 手动标注的点：绿色，比候选标记更宽更高 */
+.mk.user{background:var(--ok);width:4px;opacity:1;top:0;bottom:0;
+  box-shadow:0 0 7px rgba(53,200,138,.85)}
+.mk.user::after{content:'';position:absolute;left:-3px;top:-4px;width:10px;height:6px;
+  background:var(--ok);border-radius:2px}
 .mk.pulse{animation:pulse .85s ease-out 3}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,77,106,.75)}
   100%{box-shadow:0 0 0 22px rgba(255,77,106,0)}}
@@ -541,7 +693,7 @@ button.ghost{background:transparent}
       <button class="primary" id="go" disabled>分析高潮点</button>
       <button id="clr" disabled title="清除已导入的歌词">清除歌词</button>
       <span id="fbstats"></span>
-      <button id="exp" class="ghost" title="导出标注，用于继续训练模型">导出标注</button>
+      <button id="exp" class="ghost" title="导出精确标注（只含已标完的音轨）">导出标注</button>
       <span id="err"></span>
     </div>
 
@@ -559,9 +711,21 @@ button.ghost{background:transparent}
           <option value="2">2×</option>
         </select>
         <input type="range" id="vol" min="0" max="1" step="0.02" value="1" disabled>
+        <button id="mark" class="primary" disabled title="把当前播放位置记为高潮点（快捷键 M）">标记高潮点</button>
         <span class="sp"></span>
         <label class="muted"><input type="checkbox" id="beep" checked> 提示音</label>
         <label class="muted"><input type="checkbox" id="pauseat"> 到点暂停</label>
+      </div>
+
+      <div class="card" id="mkcard" style="display:none">
+        <h2>手动标注的高潮点
+          <span id="mkstat" class="muted"></span>
+          <label class="muted" style="float:right;font-weight:400;text-transform:none">
+            <input type="checkbox" id="mkdone"> 本轨已标完
+          </label>
+        </h2>
+        <div id="mkhint" class="muted" style="margin:-4px 0 10px;font-size:12px"></div>
+        <div id="mklist"></div>
       </div>
 
       <div class="card">
@@ -733,7 +897,7 @@ function dirRow(name, path, n, hasSub, recent){
 const esc = s => String(s).replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-function pick(path, name){
+async function pick(path, name){
   cur = path;
   cands = []; lyr = []; lyrIdx = -1; pickedLrc = '';
   document.querySelectorAll('.row.sel').forEach(e => e.classList.remove('sel'));
@@ -746,11 +910,13 @@ function pick(path, name){
   au.load();
   $('cur').textContent = '00:00';
   $('dur').textContent = '00:00';
-  $('go').disabled = false; $('clr').disabled = false;
+  $('go').disabled = false; $('clr').disabled = false; $('mark').disabled = false;
+  marks = []; markDone = false;
   $('pp').disabled = $('b10').disabled = $('f10').disabled = $('rate').disabled = $('vol').disabled = false;
   $('hits').innerHTML = '<div class="empty">点「分析高潮点」</div>';
   $('lyrcard').style.display = 'none';
   drawMarkers();
+  await loadMarks();
   toast('已选择：' + name);
 }
 
@@ -762,16 +928,20 @@ $('clr').onclick = () => {
 
 $('exp').onclick = async () => {
   try{
-    const r = await fetch('/api/feedback/export');
+    const r = await fetch('/api/marks/export');
     const d = await r.json();
-    if (!d.count){ toast('还没有标注可导出', 'err'); return; }
-    const blob = new Blob([JSON.stringify(d, null, 1)], {type:'application/json'});
+    if (!d.points){
+      toast('还没有标完的音轨可导出（勾上「本轨已标完」才算）', 'err');
+      return;
+    }
+    const blob = new Blob([JSON.stringify(d.gt, null, 1)], {type:'application/json'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'climax_feedback.json';
+    a.download = 'climax_gt_user.json';
     a.click();
     URL.revokeObjectURL(a.href);
-    toast(`已导出 ${d.count} 条（${d.pos} 真 / ${d.count - d.pos} 假）`);
+    toast(`已导出 ${d.works} 部 / ${d.tracks} 轨 / ${d.points} 个点`
+      + (d.skipped_incomplete ? `（${d.skipped_incomplete} 轨未标完，已跳过）` : ''));
   }catch(e){ toast('导出失败：' + e.message, 'err'); }
 };
 
@@ -918,6 +1088,88 @@ async function useLrc(path, name){
   else toast('这个歌词文件没有解析出内容', 'err');
 }
 
+/* ---------- 手动标注精确高潮点 ---------- */
+let marks = [];              // [秒]
+let markDone = false;
+
+async function loadMarks(){
+  if (!cur){ marks = []; markDone = false; renderMarks(); return; }
+  try{
+    const r = await fetch('/api/marks?audio=' + encodeURIComponent(cur));
+    const d = await r.json();
+    marks = d.times || []; markDone = !!d.done;
+  }catch(e){ marks = []; markDone = false; }
+  renderMarks();
+  drawMarkers();
+}
+
+async function addMark(){
+  if (!cur || !au.duration) return;
+  const t = Math.round(au.currentTime * 100) / 100;
+  if (marks.some(x => Math.abs(x - t) < 1)){ toast('这个位置已经标过了'); return; }
+  marks.push(t); marks.sort((a,b) => a - b);
+  renderMarks(); drawMarkers();
+  toast(`已标记 ${fmt(t)}`);
+  await post({action:'add', time:t});
+}
+
+async function delMark(t){
+  marks = marks.filter(x => Math.abs(x - t) > 1e-6);
+  renderMarks(); drawMarkers();
+  await post({action:'del', time:t});
+}
+
+async function setDone(v){
+  markDone = v;
+  await post({action: v ? 'done' : 'undone'});
+  toast(v ? '已确认本轨标完 —— 可以作为训练标注使用' : '已取消「标完」');
+}
+
+async function post(body){
+  try{
+    const r = await fetch('/api/marks', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({audio: cur, ...body})
+    });
+    const d = await r.json();
+    if (d.times){ marks = d.times; }
+    renderMarks(); drawMarkers();
+  }catch(e){ toast('保存失败：' + e.message, 'err'); }
+}
+
+function renderMarks(){
+  const card = $('mkcard');
+  const has = cur && (marks.length || markDone);
+  card.style.display = has ? '' : 'none';
+  $('mkstat').textContent = marks.length ? `　共 ${marks.length} 个` : '';
+  $('mkdone').checked = markDone;
+  $('mkhint').innerHTML = markDone
+    ? '✓ 本轨已标完，会作为训练标注使用（模型漏掉的高潮也已被你补齐）'
+    : '边听边按 <b>M</b> 标出每个高潮点。标完后勾上「本轨已标完」才会用于训练 —— '
+      + '没标完就使用会让模型把你漏标的高潮学成负例。';
+  const box = $('mklist'); box.innerHTML = '';
+  marks.forEach((t, i) => {
+    const el = document.createElement('div');
+    el.className = 'hit';
+    el.dataset.t = t;
+    el.innerHTML = `<span class="t">${fmt(t)}</span>`
+      + `<span class="x">手动标注 #${i+1}</span>`
+      + `<span class="vb"><button class="n" title="删除这个标注">✗</button></span>`;
+    el.onclick = e => {
+      if (e.target.closest('.vb')) return;
+      au.currentTime = Math.max(0, t - 1.5); au.play();
+    };
+    el.querySelector('.vb button').onclick = e => { e.stopPropagation(); delMark(t); };
+    box.appendChild(el);
+  });
+  if (!marks.length){
+    box.innerHTML = '<div class="empty">还没有标注。播放时按 M 记录当前时刻。</div>';
+  }
+}
+
+$('mark').onclick = addMark;
+$('mkdone').onchange = e => setDone(e.target.checked);
+
 /* ---------- 时间轴 ---------- */
 const tl = $('tl');
 function pct(t){ return au.duration ? (t/au.duration*100) : 0; }
@@ -931,6 +1183,16 @@ function drawMarkers(){
     g.style.left = (m/12*100) + '%'; tl.appendChild(g);
   }
   const seen = [];
+  // 手动标注的点画在最上层（绿色），候选标记在下
+  for (const t of marks){
+    if (!au.duration) break;
+    const el = document.createElement('div');
+    el.className = 'mk user';
+    el.style.left = pct(t) + '%';
+    el.dataset.mk = t;
+    el.title = '手动标注 ' + fmt(t);
+    tl.appendChild(el);
+  }
   for (const c of cands){
     if (!au.duration) break;
     const el = document.createElement('div');
@@ -986,6 +1248,7 @@ $('vol').oninput  = () => au.volume = +$('vol').value;
 au.onloadedmetadata = () => {
   $('dur').textContent = fmt(au.duration);
   drawMarkers();
+  loadMarks();          // 时长就绪后重绘（标注位置按百分比算，需要 duration）
 };
 au.ontimeupdate = () => { $('cur').textContent = fmt(au.currentTime); updateBar(); tick(); };
 au.onseeking = () => { updateBar(); };
@@ -998,6 +1261,7 @@ document.addEventListener('keydown', e => {
   else if (e.code === 'ArrowRight'){ e.preventDefault(); seek(au.currentTime + 5); }
   else if (e.code === 'ArrowUp'){ e.preventDefault(); au.volume = Math.min(1, au.volume + .05); $('vol').value = au.volume; }
   else if (e.code === 'ArrowDown'){ e.preventDefault(); au.volume = Math.max(0, au.volume - .05); $('vol').value = au.volume; }
+  else if (e.code === 'KeyM'){ e.preventDefault(); addMark(); }
 });
 
 /* ---------- 提示逻辑 ---------- */

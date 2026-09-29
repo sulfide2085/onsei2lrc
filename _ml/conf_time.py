@@ -32,7 +32,7 @@ for hold in works:
         by[(rj, tk)].append((s, tk, t, rj))
     for (rj, tk), grp in by.items():
         gts = GT.get(rj, {}).get(tk)
-        if not gts:
+        if gts is None:      # 空列表（0 次的音轨）也要评估
             continue
         grp = sorted(grp, key=lambda x: -x[0])
         reps = []
