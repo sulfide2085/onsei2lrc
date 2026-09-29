@@ -16,6 +16,9 @@ uvicorn>=0.27
 python-multipart         # FastAPI 的文件上传支持
 starlette                # FastAPI 的依赖
 
+# ---- climax_finder 的 ml 模型（用 --model formula 可不装）----
+scikit-learn>=1.3       # 随机森林 / 梯度提升 / 逻辑回归 + isotonic 校准
+
 # ---- 可选 ----
 # torch                  # 仅当需要 ctranslate2 的 CUDA 运行时时才装（见 README 第 4 节）
 # soundfile              # 若不用 ffmpeg 解码，可用它替代

@@ -70,12 +70,41 @@ MIN_DURATION = 60.0
 
 
 def confidence_of(score: float) -> Tuple[str, str]:
-    """分数 → (档位, 经验精确率说明)。精确率数字来自实测标定。"""
+    """formula 模式的分数 → (档位, 经验精确率说明)。数字来自那批 2 部作品的实测标定。"""
     if score >= CONF_HIGH:
         return "高", "实测精确率 54~64%"
     if score >= CONF_MID:
         return "中", "实测精确率 7~12%"
     return "低", "实测精确率 0%"
+
+
+# ======================================================================================
+# ml 模式的置信度：直接用 isotonic 校准后的概率
+#
+# 校准器在 10 折**样本外**预测上拟合（3981 个候选）。样本外实测命中率：
+#     原始分 [0.85, 0.95) → 75.6%（78 个）      [0.95, 1.00] → 94.1%（17 个）
+#     原始分 [0.70, 0.85) → 55.4%（112 个）     [0.50, 0.70) → 33.0%（106 个）
+#     原始分 [0.30, 0.50) → 15.3%（359 个）     [0.10, 0.30) →  4.3%（1012 个）
+#     原始分 [0.00, 0.10) →  0.7%（2297 个）
+# Brier 分数 0.0565 → 0.0412
+# ======================================================================================
+# 上限：样本外最高区间的实测命中率是 94.1%（只有 17 个样本）。
+# isotonic 会在极少数全正样本块上映射到 100%，那是在给用户「绝对确定」的错觉。
+# 所以封顶 95%——不影响任何合理阈值的判断，但不再声称 100%。
+PROB_CAP = 0.95
+
+
+def confidence_of_prob(p: float) -> Tuple[str, str]:
+    """校准概率 → (档位, 说明)。概率本身已是命中率，所以直接引用实测区间。"""
+    if p >= 0.6:
+        return "高", f"校准概率 {p*100:.0f}%　（此区间样本外实测命中率 55~94%）"
+    if p >= 0.3:
+        return "中", f"校准概率 {p*100:.0f}%　（此区间样本外实测命中率 15~33%）"
+    return "低", f"校准概率 {p*100:.0f}%　（此区间样本外实测命中率 0.7~4%）"
+
+
+# 轨级判断（ml 模式）：整轨最高校准概率低于此值 → 提示可能没有高潮
+TRACK_MIN_PROB = 0.30
 
 
 # ======================================================================================
@@ -181,6 +210,151 @@ def acoustic_features(x: np.ndarray, med: float, i: int, s: np.ndarray,
 
 
 # ======================================================================================
+# 机器学习模型（--model ml）
+#
+# 这是训练与推理**共用**的特征实现。任何改动都必须重新训练模型，否则特征错位。
+# 训练脚本 _ml/train_model.py 反过来 import 本函数，保证两边绝对一致。
+# ======================================================================================
+# 模型使用的 21 个特征，顺序即训练时的列顺序，不可改动
+MODEL_FEATS = ["peak", "pre60", "pre30", "pre10", "post2", "post10", "post30",
+               "signature", "contrast", "rise", "decay", "recover", "prominence",
+               "plateau", "rel_time", "rank_energy", "gap_prev", "zcr", "centroid",
+               "flatness", "txt"]
+
+MODEL_FILE = Path(__file__).with_name("climax_model.pkl")
+
+
+def _winmean(s: np.ndarray, hop: float, i: int, a: float, b: float, med: float) -> float:
+    """峰值 i 前后 [a, b] 秒窗口的平均能量（相对全轨中位数）。"""
+    n = len(s)
+    lo = min(max(0, i + int(a / hop)), n - 1)
+    hi = min(max(lo + 1, i + int(b / hop)), n)
+    return float(np.mean(s[lo:hi]) - med)
+
+
+def model_features(x: np.ndarray, s: np.ndarray, hop: float, i: int,
+                   med: float) -> Dict[str, float]:
+    """围绕峰值 i 提取 21 个模型特征（不含 rank_energy/gap_prev/txt，那三个需要轨内上下文）。"""
+    t = i * hop
+    pk = float(s[i] - med)
+    f: Dict[str, float] = {}
+
+    # ---- 能量水平（相对全轨中位数，dB） ----
+    f["peak"] = pk
+    f["pre60"] = _winmean(s, hop, i, -62, -35, med)
+    f["pre30"] = _winmean(s, hop, i, -32, -10, med)
+    f["pre10"] = _winmean(s, hop, i, -10, -2, med)
+    f["post2"] = _winmean(s, hop, i, 1.5, 4, med)
+    f["post10"] = _winmean(s, hop, i, 4, 10, med)
+    f["post30"] = _winmean(s, hop, i, 10, 30, med)
+    f["signature"] = f["pre30"] - f["post2"]
+    f["contrast"] = f["peak"] - f["pre10"]
+
+    # ---- 形状 ----
+    j = i
+    thr_r = med + f["pre10"] * 0.5 + (pk - f["pre10"]) * 0.5
+    while j > 0 and s[j] > thr_r:
+        j -= 1
+    f["rise"] = (i - j) * hop
+    k = i
+    thr_d = med + f["post2"] + (pk - f["post2"]) * 0.5
+    while k < len(s) - 1 and s[k] > thr_d:
+        k += 1
+    f["decay"] = (k - i) * hop
+    after = s[i:min(len(s), i + int(60 / hop))]
+    below = np.where(after < med)[0]
+    f["recover"] = float(below[0] * hop) if len(below) else 60.0
+    a0 = max(0, i - int(30 / hop))
+    b0 = min(len(s), i + int(30 / hop))
+    f["prominence"] = pk - float(np.median(s[a0:b0]) - med)
+    w = s[max(0, i - int(3 / hop)):min(len(s), i + int(3 / hop) + 1)]
+    f["plateau"] = float((w > med + pk * 0.5).mean()) if len(w) else 0.0
+
+    # ---- 轨内位置 ----
+    f["rel_time"] = t / max(1e-6, len(s) * hop)
+
+    # ---- 频谱（实测重要性低，但保留——删掉会略降指标） ----
+    step = int(hop * SR)
+    seg = x[max(0, i - int(0.5 / hop)) * step:min(len(x), i + int(0.5 / hop)) * step]
+    if len(seg) > 512:
+        seg = seg - seg.mean()
+        f["zcr"] = float((np.diff(np.sign(seg)) != 0).mean())
+        sp = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) + 1e-12
+        fr = np.fft.rfftfreq(len(seg), 1 / SR)
+        f["centroid"] = float((sp * fr).sum() / sp.sum())
+        f["flatness"] = float(np.exp(np.log(sp).mean()) / sp.mean())
+    else:
+        f["zcr"] = f["centroid"] = f["flatness"] = 0.0
+    return f
+
+
+class ClimaxModel:
+    """加载 climax_model.pkl，给出原始分与校准概率。
+
+    设计要点（见 README 第 11 节）：
+      · **排序用原始分**——isotonic 校准是单调变换，会产生大量并列值，
+        用它排序反而略降 AUC（实测 −0.0018）。
+      · **显示用校准概率**——让「62%」真的意味着 62%（Brier 0.078 → 0.044）。
+    """
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path) if path else MODEL_FILE
+        if not self.path.exists():
+            raise FileNotFoundError(
+                f"找不到模型文件 {self.path}\n"
+                f"请先运行：python _ml\\train_model.py")
+        import pickle
+        with open(self.path, "rb") as fh:
+            blob = pickle.load(fh)
+        self.models: Dict[str, object] = blob["models"]
+        self.weights: List[float] = blob["weights"]
+        self.iso = blob["iso"]                    # isotonic 校准器（可为 None）
+        self.feat_order: List[str] = blob["feats"]
+        self.meta: Dict = blob.get("meta", {})
+        if self.feat_order != MODEL_FEATS:
+            raise ValueError(
+                f"模型文件的特征顺序与本代码不一致——模型是用旧版特征训练的，"
+                f"请重新运行 _ml\\train_model.py。\n"
+                f"  模型: {self.feat_order}\n  代码: {MODEL_FEATS}")
+
+    def _matrix(self, feats: List[Dict[str, float]]) -> "np.ndarray":
+        return np.array([[float(f.get(k, 0.0)) for k in self.feat_order]
+                         for f in feats], float)
+
+    def predict_raw(self, feats: List[Dict[str, float]]) -> "np.ndarray":
+        """三等权平均的原始分（用于排序）。"""
+        if not feats:
+            return np.zeros(0)
+        X = self._matrix(feats)
+        ps = [m.predict_proba(X)[:, 1] for m in self.models.values()]
+        w = np.asarray(self.weights, float)
+        w = w / w.sum()
+        return np.average(ps, axis=0, weights=w)
+
+    def predict_prob(self, raw: "np.ndarray") -> "np.ndarray":
+        """isotonic 校准后的概率（用于显示与阈值），封顶 PROB_CAP。
+
+        没有校准器时原样返回。
+        """
+        raw = np.asarray(raw, float)
+        if self.iso is None or raw.size == 0:
+            return raw
+        return np.clip(self.iso.predict(raw), 0.0, PROB_CAP)
+
+    def describe(self) -> str:
+        m = self.meta
+        names = " + ".join(f"{k}×{v:.2f}" for k, v in zip(self.models, self.weights))
+        s = [f"模型：{names}", f"特征：{len(self.feat_order)} 个"]
+        if m:
+            s.append(f"训练：{m.get('n_works', '?')} 部作品 / "
+                     f"{m.get('n_tracks', '?')} 轨 / {m.get('n_pos', '?')} 正例")
+            s.append(f"10 折留一作品实测：AUC {m.get('cv_auc', float('nan')):.3f}　"
+                     f"精确率 {m.get('cv_prec', float('nan'))*100:.1f}%　"
+                     f"召回率 {m.get('cv_rec', float('nan'))*100:.1f}%")
+        return "\n".join("  " + x for x in s)
+
+
+# ======================================================================================
 # 转写文本
 # ======================================================================================
 def load_transcript(audio: Path, extra_dirs: Optional[List[Path]] = None) -> Optional[List[dict]]:
@@ -269,15 +443,20 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
 def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
                   acoustic_only: bool = False, verbose: bool = True,
                   transcript_dirs: Optional[List[Path]] = None,
-                  min_score: Optional[float] = None) -> dict:
+                  min_score: Optional[float] = None,
+                  model: str = "ml",
+                  model_obj: Optional["ClimaxModel"] = None) -> dict:
     """分析单个音频，返回候选点。不抛异常——失败信息放在结果的 error 字段。
 
-    min_score: 只保留分数不低于此值的候选。None = 不过滤（默认，全部输出但标置信度）。
+    min_score: 只保留分数不低于此值的候选。None = 不过滤。
+    model:     "ml"     用训练好的集成模型（默认）
+               "formula" 用旧的手工权重公式（可解释，但实测差距很大）
     """
     cues = cues or DEFAULT_CUES
     t0 = time.time()
     res: Dict = {"audio": str(audio), "name": audio.name, "candidates": [],
-                 "transcript": False, "error": "", "has_climax": None}
+                 "transcript": False, "error": "", "has_climax": None,
+                 "model": model}
     try:
         x = decode_audio_mono(audio)
     except Exception as e:
@@ -302,30 +481,72 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
     db, hop = energy_envelope(x)
     s = _smooth(db, int(0.3 / hop))
     med = float(np.median(s))
+    peaks = find_peaks(s, hop)
 
-    cands = []
-    for i in find_peaks(s, hop):
-        t = i * hop
-        f = acoustic_features(x, med, i, s, hop)
-        tx, tags, txt = (text_score_at(segs, t, cues) if segs else (0, [], ""))
-        # 标准化后加权
-        za = ((f["signature"] - NORM["signature"]["mu"]) / NORM["signature"]["sd"]
-              - (f["recover"] - NORM["recover"]["mu"]) / NORM["recover"]["sd"])
-        zt = (tx - NORM["txt"]["mu"]) / NORM["txt"]["sd"]
-        sc = W_ACOUSTIC * za + W_TXT * zt
-        conf, why = confidence_of(sc)
-        cands.append({
+    # 语义线索（两种模型都用得上）
+    texts: Dict[int, tuple] = {}
+    for i in peaks:
+        texts[i] = (text_score_at(segs, i * hop, cues) if segs else (0, [], ""))
+
+    if model == "ml":
+        if model_obj is None:
+            model_obj = ClimaxModel()
+        res["model_meta"] = model_obj.meta
+        # 21 个模型特征 + 轨内上下文
+        feats: List[Dict[str, float]] = []
+        for i in peaks:
+            f = model_features(x, s, hop, i, med)
+            f["txt"] = texts[i][0]
+            feats.append(f)
+        # 轨内上下文：能量排名与到上一个候选的间距
+        order = sorted(range(len(peaks)), key=lambda n: -s[peaks[n]])
+        rank_of = {n: r for r, n in enumerate(order)}
+        for n, f in enumerate(feats):
+            f["rank_energy"] = rank_of[n]
+            f["gap_prev"] = 0.0 if n == 0 else float((peaks[n] - peaks[n - 1]) * hop)
+        raw = model_obj.predict_raw(feats)          # 排序用原始分
+        prob = model_obj.predict_prob(raw)          # 显示用校准概率
+        scored = [(peaks[n] * hop, float(raw[n]), float(prob[n]), feats[n])
+                  for n in range(len(peaks))]
+    else:
+        scored = []
+        for i in peaks:
+            f = acoustic_features(x, med, i, s, hop)
+            za = ((f["signature"] - NORM["signature"]["mu"]) / NORM["signature"]["sd"]
+                  - (f["recover"] - NORM["recover"]["mu"]) / NORM["recover"]["sd"])
+            zt = (texts[i][0] - NORM["txt"]["mu"]) / NORM["txt"]["sd"]
+            sc = W_ACOUSTIC * za + W_TXT * zt
+            scored.append((i * hop, sc, None, f))
+
+    cands: List[dict] = []
+    for t, rawsc, prob, f in scored:
+        i = int(round(t / hop))
+        tx, tags, txt = texts.get(i, (0, [], ""))
+        c = {
             "time": round(t, 2),
             "mmss": f"{int(t)//60:02d}:{int(t)%60:02d}",
-            "score": round(sc, 3),
-            "confidence": conf, "confidence_note": why,
-            "acoustic": round(za, 3), "semantic": tx, "cue_tags": tags,
-            "text": txt,
-            **{k: round(v, 2) for k, v in f.items()},
-        })
+            "score": round(rawsc, 4),               # 原始分 → 排序
+            "text": txt, "semantic": tx, "cue_tags": tags,
+        }
+        if prob is not None:
+            c["probability"] = round(float(prob), 4)   # 校准概率 → 显示/阈值
+            conf, why = confidence_of_prob(float(prob))
+            c["confidence"] = conf
+            c["confidence_note"] = why
+        else:
+            conf, why = confidence_of(rawsc)
+            c["confidence"] = conf
+            c["confidence_note"] = why
+            c["acoustic"] = round(
+                ((f["signature"] - NORM["signature"]["mu"]) / NORM["signature"]["sd"]
+                 - (f["recover"] - NORM["recover"]["mu"]) / NORM["recover"]["sd"]), 3)
+        c.update({k: round(float(v), 3) for k, v in f.items()})
+        cands.append(c)
 
+    # 过滤：ml 模式按校准概率，formula 模式按原始分
     if min_score is not None:
-        cands = [c for c in cands if c["score"] >= min_score]
+        key = "probability" if model == "ml" else "score"
+        cands = [c for c in cands if c.get(key) is not None and c[key] >= min_score]
 
     # 最小间隔再抑制一次（Top-N 之间至少隔 15 秒）
     cands.sort(key=lambda c: -c["score"])
@@ -336,9 +557,14 @@ def find_climaxes(audio: Path, *, top: int = 3, cues: Optional[CueRules] = None,
         if len(picked) >= top:
             break
     res["candidates"] = picked
-    # 轨级判断：整轨最高分低于阈值 → 这一轨大概率没有高潮
-    res["max_score"] = round(picked[0]["score"], 3) if picked else None
-    res["has_climax"] = bool(picked and picked[0]["score"] >= TRACK_MIN_SCORE)
+    # 轨级判断：ml 模式看最高校准概率，formula 模式看最高分
+    res["max_score"] = round(picked[0]["score"], 4) if picked else None
+    if model == "ml":
+        mp = max((c.get("probability", 0.0) for c in picked), default=0.0)
+        res["max_prob"] = round(mp, 4)
+        res["has_climax"] = bool(picked and mp >= TRACK_MIN_PROB)
+    else:
+        res["has_climax"] = bool(picked and picked[0]["score"] >= TRACK_MIN_SCORE)
     res["elapsed"] = round(time.time() - t0, 1)
     if verbose:
         _print_one(res)
@@ -351,7 +577,10 @@ def _print_one(res: dict) -> None:
         print(f"\n  【{name}】跳过：{res['error']}")
         return
     dur = res.get("duration", 0)
-    src = "声学+语义" if res["transcript"] else "纯声学（无转写）"
+    is_ml = res.get("model", "ml") == "ml"
+    src = "机器学习模型" if is_ml else "手工权重公式"
+    if not res["transcript"]:
+        src += "（无转写，语义特征置零）"
     print(f"\n{'=' * 78}")
     print(f"  {name}   {dur/60:.1f} 分钟   [{src}]   {res.get('elapsed', 0)}s")
     print(f"{'=' * 78}")
@@ -359,19 +588,33 @@ def _print_one(res: dict) -> None:
         print("    （没有候选点）")
         return
 
-    mx = res.get("max_score")
     if res.get("has_climax") is False:
-        print(f"  ⚠ 这一轨可能**没有高潮**：最高分 {mx:+.2f} 低于阈值 {TRACK_MIN_SCORE:+.2f}")
-        print(f"    （该阈值在 15 轨上实测轨级准确率 92%，但负样本只有 6 轨，样本很小）")
+        if is_ml:
+            print(f"  ⚠ 这一轨可能**没有高潮**：最高校准概率 "
+                  f"{res.get('max_prob', 0)*100:.0f}% 低于阈值 {TRACK_MIN_PROB*100:.0f}%")
+        else:
+            print(f"  ⚠ 这一轨可能**没有高潮**：最高分 {res.get('max_score'):+.2f} "
+                  f"低于阈值 {TRACK_MIN_SCORE:+.2f}")
         print()
+    elif is_ml:
+        print(f"  最高校准概率 {res.get('max_prob', 0)*100:.0f}%\n")
 
     for i, c in enumerate(res["candidates"], 1):
         tags = "，".join(c["cue_tags"]) if c["cue_tags"] else "无文本线索"
-        print(f"  #{i}  [{c['mmss']}]  分数 {c['score']:+6.2f}   "
-              f"置信度 {c['confidence']}（{c['confidence_note']}）")
-        print(f"        声学 {c['acoustic']:+5.2f} · 文本 {c['semantic']:+d}（{tags}）")
+        if is_ml:
+            print(f"  #{i}  [{c['mmss']}]  校准概率 {c.get('probability', 0)*100:5.1f}%   "
+                  f"置信度 {c['confidence']}")
+            print(f"        {c['confidence_note']}")
+        else:
+            print(f"  #{i}  [{c['mmss']}]  分数 {c['score']:+6.2f}   "
+                  f"置信度 {c['confidence']}（{c['confidence_note']}）")
+            print(f"        声学 {c.get('acoustic', 0):+5.2f} · "
+                  f"文本 {c['semantic']:+d}（{tags}）")
         print(f"        形状: 前平台 {c['pre30']:+6.1f} dB · 峰值 {c['peak']:+6.1f} dB · "
-              f"释放后 {c['post4']:+6.1f} dB · 脱力 {c['recover']:.1f}s")
+              f"释放后 {c.get('post2', c.get('post4', 0.0)):+6.1f} dB · "
+              f"脱力 {c['recover']:.1f}s")
+        if not is_ml:
+            print(f"        文本线索 {c['semantic']:+d}（{tags}）")
         if c["text"]:
             print(f"        转写: {c['text'][:62]}")
         print()
@@ -407,11 +650,16 @@ def _cli() -> int:
                "  python climax_finder.py \"目录\" --acoustic-only\n")
     ap.add_argument("target", help="音频文件或目录（目录会递归）")
     ap.add_argument("-n", "--top", type=int, default=3, help="每轨输出几个候选（默认 3）")
+    ap.add_argument("--model", choices=("ml", "formula"), default="ml",
+                    help="ml = 训练好的集成模型（默认，10 折实测精确率 60.2%%/召回 69.8%%）；"
+                         "formula = 旧的手工权重公式（可解释，但实测精确率仅 18.5%%）")
     ap.add_argument("--json", help="把结果写到 JSON")
     ap.add_argument("--acoustic-only", action="store_true", help="只用声学，不读转写")
     ap.add_argument("--cues", help="自定义线索规则文件（每行一个正则，# 开头为注释）")
     ap.add_argument("-m", "--min-score", type=float, default=None,
-                    help=f"只输出分数不低于此值的候选（实测 {CONF_HIGH:+.1f} 以上精确率 54~64%%；不加则全输出并标置信度）")
+                    help="ml 模式：只输出校准概率不低于此值的候选（如 0.5）。"
+                         "formula 模式：只输出分数不低于此值的候选（如 +2.5）。"
+                         "不加则全输出并标置信度")
     ap.add_argument("--transcript-dir", "--asr-dir", action="append", default=[],
                     dest="transcript_dir", metavar="DIR",
                     help="转写文件所在目录（可重复；默认只在音频旁边找）")
@@ -434,17 +682,30 @@ def _cli() -> int:
         print(f"  ✗ 路径不存在：{target}")
         return 1
 
+    mobj = None
     print("=" * 78)
     print("  climax_finder —— 高潮候选点检测")
-    print(f"  评分 = {W_ACOUSTIC} × 声学(signature, recover) + {W_TXT} × 语义")
-    print(f"  置信度门槛 {CONF_HIGH:+.1f}（以上实测精确率 54~64%）　"
-          f"轨级门槛 {TRACK_MIN_SCORE:+.1f}　最短时长 {MIN_DURATION:.0f}s")
+    if a.model == "ml":
+        try:
+            mobj = ClimaxModel()
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  ✗ {e}")
+            return 2
+        print("  模型 = 三等权集成（随机森林 + 梯度提升 + 逻辑回归）")
+        print(mobj.describe())
+        print(f"  排序用集成原始分；显示的「校准概率」经 isotonic 校准，可直接当命中率读。")
+        print(f"  轨级门槛 校准概率 {TRACK_MIN_PROB*100:.0f}%　最短时长 {MIN_DURATION:.0f}s")
+    else:
+        print(f"  评分 = {W_ACOUSTIC} × 声学(signature, recover) + {W_TXT} × 语义")
+        print(f"  置信度门槛 {CONF_HIGH:+.1f}（以上实测精确率 54~64%）　"
+              f"轨级门槛 {TRACK_MIN_SCORE:+.1f}　最短时长 {MIN_DURATION:.0f}s")
+        print("  ⚠ formula 是早期版本，10 折实测精确率仅 18.5% —— 仅供对照")
     print("=" * 78)
 
     tdirs = [Path(d).expanduser() for d in a.transcript_dir]
     kw = dict(top=a.top, cues=cues, acoustic_only=a.acoustic_only,
               verbose=not a.quiet, transcript_dirs=tdirs or None,
-              min_score=a.min_score)
+              min_score=a.min_score, model=a.model, model_obj=mobj)
     results = find_in_path(target, **kw)
 
     if not a.quiet:

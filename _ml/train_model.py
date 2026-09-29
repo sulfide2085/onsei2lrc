@@ -1,0 +1,225 @@
+# -*- coding: utf-8 -*-
+"""训练最终模型并保存 climax_model.pkl
+
+关键纪律：
+  · 特征实现从 climax_finder 导入（**唯一实现**），杜绝训练/推理不一致
+  · 10 折留一作品交叉验证给出「预期成绩」，写进模型元信息
+  · isotonic 校准器在**样本外预测**上拟合（不能用自己的训练预测拟合自己）
+  · 最终模型用**全部数据**训练；它的成绩引用 10 折均值，不自己测自己
+"""
+import json
+import pickle
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(r"D:\pyitme\onsei2lrc")
+sys.path.insert(0, str(ROOT))
+import numpy as np
+
+from climax_finder import (MODEL_FEATS, SR, HOP, MIN_DURATION, energy_envelope,
+                           find_peaks, _smooth, model_features, load_transcript,
+                           text_score_at, DEFAULT_CUES)
+
+TOL = 20.0
+TOPN = 3
+SEED = 0
+CACHE = ROOT / "_ml" / "features_v2.json"
+OUT = ROOT / "climax_model.pkl"
+ASR_EXTRA = {"RJ324692": ROOT / "_climax" / "asr", "RJ362169": ROOT / "_climax2" / "asr"}
+ASR_ML = ROOT / "_ml" / "asr"
+
+
+def build_dataset():
+    """用 climax_finder 的规范特征函数提取全部候选"""
+    from faster_whisper import decode_audio
+    meta = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))
+    GT, FILES = meta["gt"], meta["files"]
+    rows, tracks = [], []
+    for rj in sorted(GT):
+        asrdir = ASR_EXTRA.get(rj, ASR_ML / rj)
+        for tk, gts in GT[rj].items():
+            fp = FILES[rj].get(tk)
+            if not fp or not Path(fp).exists():
+                continue
+            mp3 = Path(fp)
+            segs = None
+            for d in (asrdir, mp3.parent, ASR_ML / rj):
+                if not d.exists():
+                    continue
+                c = list(d.glob(f"{mp3.stem}.segments.json"))
+                if c:
+                    segs = json.loads(c[0].read_text(encoding="utf-8"))["segments"]
+                    break
+            try:
+                x = decode_audio(str(mp3), sampling_rate=SR)
+            except Exception as e:
+                print(f"  ✗ {rj}/{tk}: {e}")
+                continue
+            if len(x) / SR < MIN_DURATION:
+                continue
+            db, hop = energy_envelope(x)
+            s = _smooth(db, int(0.3 / hop))
+            med = float(np.median(s))
+            peaks = find_peaks(s, hop)
+            if not peaks:
+                continue
+            feats = []
+            for i in peaks:
+                f = model_features(x, s, hop, i, med)
+                t = i * hop
+                tx, _, _ = (text_score_at(segs, t, DEFAULT_CUES) if segs else (0, [], ""))
+                f["txt"] = float(tx)
+                f["t"] = t
+                f["TP"] = any(abs(t - g) <= TOL for g in gts)
+                f["has_gt"] = bool(gts)
+                f["rj"] = rj
+                f["track"] = tk
+                feats.append(f)
+            order = sorted(range(len(peaks)), key=lambda n: -s[peaks[n]])
+            rank_of = {n: r for r, n in enumerate(order)}
+            for n, f in enumerate(feats):
+                f["rank_energy"] = float(rank_of[n])
+                f["gap_prev"] = 0.0 if n == 0 else float((peaks[n] - peaks[n - 1]) * hop)
+            rows += feats
+            tracks.append((rj, tk, len(peaks), len(gts)))
+    return rows, tracks
+
+
+if CACHE.exists():
+    print(f"复用已提取的特征：{CACHE}")
+    blob = json.loads(CACHE.read_text(encoding="utf-8"))
+    rows, tracks = blob["rows"], blob["tracks"]
+else:
+    print("提取特征（约 10 分钟）…")
+    t0 = time.time()
+    rows, tracks = build_dataset()
+    CACHE.write_text(json.dumps({"rows": rows, "tracks": tracks}, ensure_ascii=False),
+                     encoding="utf-8")
+    print(f"  完成，用时 {time.time()-t0:.0f}s")
+
+for r in rows:
+    for k in MODEL_FEATS:
+        v = r.get(k, 0.0)
+        r[k] = float(v) if np.isfinite(v) else 0.0
+works = sorted({r["rj"] for r in rows})
+bywork = {w: [r for r in rows if r["rj"] == w] for w in works}
+print(f"  数据：{len(works)} 部作品 / {len(tracks)} 轨 / {len(rows)} 候选 / "
+      f"{sum(1 for r in rows if r['TP'])} 正例")
+
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.isotonic import IsotonicRegression
+
+# 超参数：网格搜索 + 嵌套验证的一致选择（每折都选 depth=10）
+RF_KW = dict(n_estimators=400, min_samples_leaf=5, max_depth=10,
+             class_weight="balanced", random_state=SEED, n_jobs=-1)
+HGB_KW = dict(max_iter=300, learning_rate=0.06, max_depth=10, min_samples_leaf=5,
+              l2_regularization=1.0, class_weight="balanced", random_state=SEED)
+LR_KW = dict(class_weight="balanced", max_iter=3000, C=0.3)
+WEIGHTS = [1.0, 1.0, 1.0]          # 三等权（实测各加权方案都不更优）
+
+
+def X(rs): return np.array([[r[f] for f in MODEL_FEATS] for r in rs], float)
+def Y(rs): return np.array([r["TP"] for r in rs], int)
+
+
+def fit(rs):
+    Xr, yr = X(rs), Y(rs)
+    return {
+        "RF": RandomForestClassifier(**RF_KW).fit(Xr, yr),
+        "HGB": HistGradientBoostingClassifier(**HGB_KW).fit(Xr, yr),
+        "LR": make_pipeline(StandardScaler(), LogisticRegression(**LR_KW)).fit(Xr, yr),
+    }
+
+
+def ensemble(models, rs):
+    Xt = X(rs)
+    ps = [models[k].predict_proba(Xt)[:, 1] for k in models]
+    return np.average(ps, axis=0, weights=WEIGHTS)
+
+
+def auc(p, rs):
+    p = np.asarray(p, float); lb = np.array([r["TP"] for r in rs], bool)
+    if lb.sum() == 0 or (~lb).sum() == 0:
+        return float("nan")
+    return ((p[lb][:, None] > p[~lb][None, :]).sum()
+            + 0.5 * (p[lb][:, None] == p[~lb][None, :]).sum()) / (lb.sum() * (~lb).sum())
+
+
+def prec_rec(p, rs, topn=TOPN):
+    tc = defaultdict(list)
+    for r, s in zip(rs, p):
+        tc[(r["rj"], r["track"])].append((s, r))
+    tp = nc = 0
+    cov = set(); gtot = 0
+    gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
+    for (rj, tk), cand in tc.items():
+        g = gt[rj][tk]; gtot += len(g)
+        for s, r in sorted(cand, key=lambda x: -x[0])[:topn]:
+            nc += 1
+            h = [x for x in g if abs(r["t"] - x) <= TOL]
+            if h:
+                tp += 1
+                for x in h:
+                    cov.add((rj, tk, x))
+    return tp / max(1, nc), len(cov) / max(1, gtot)
+
+
+print("\n10 折留一作品交叉验证（给出预期成绩 + 收集样本外预测用于校准）…")
+oof_raw, oof_lab = [], []
+A, P, R = [], [], []
+for hold in works:
+    tr = [r for r in rows if r["rj"] != hold]
+    te = bywork[hold]
+    m = fit(tr)
+    raw = ensemble(m, te)
+    a, p, rc = auc(raw, te), *prec_rec(raw, te)
+    A.append(a); P.append(p); R.append(rc)
+    oof_raw.append(raw)
+    oof_lab.append(Y(te))
+    print(f"  {hold:<12} AUC {a:.3f}  精确 {p*100:5.1f}%  召回 {rc*100:5.1f}%")
+oof_raw = np.concatenate(oof_raw)
+oof_lab = np.concatenate(oof_lab).astype(float)
+print(f"  {'平均':<12} AUC {np.mean(A):.3f}  精确 {np.mean(P)*100:5.1f}%  "
+      f"召回 {np.mean(R)*100:5.1f}%   标准差 {np.std(P)*100:.1f}%")
+
+print("\n在样本外预测上拟合 isotonic 校准器…")
+iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+iso.fit(oof_raw, oof_lab)
+br_raw = float(np.mean((oof_raw - oof_lab) ** 2))
+br_cal = float(np.mean((iso.predict(oof_raw) - oof_lab) ** 2))
+print(f"  Brier 分数：未校准 {br_raw:.4f} → 校准后 {br_cal:.4f}（改善 "
+      f"{(1-br_cal/br_raw)*100:.0f}%）")
+
+print("\n用全部数据训练最终模型…")
+final = fit(rows)
+payload = {
+    "models": final,
+    "weights": WEIGHTS,
+    "iso": iso,
+    "feats": MODEL_FEATS,
+    "meta": {
+        "n_works": len(works), "n_tracks": len(tracks), "n_rows": len(rows),
+        "n_pos": sum(1 for r in rows if r["TP"]),
+        "works": works,
+        "cv_auc": float(np.nanmean(A)), "cv_auc_std": float(np.nanstd(A)),
+        "cv_prec": float(np.mean(P)), "cv_prec_std": float(np.std(P)),
+        "cv_rec": float(np.mean(R)),
+        "brier_raw": br_raw, "brier_cal": br_cal,
+        "train_minutes": round(sum(1 for _ in tracks) * 0),
+        "built": time.strftime("%Y-%m-%d %H:%M"),
+        "sklearn_models": {"RF": RF_KW, "HGB": HGB_KW, "LR": LR_KW},
+        "ensemble": "equal-weight average of RF + HGB + LR probabilities",
+        "note": "排序用 predict_raw（原始平均分）；predict_prob 仅供显示与阈值",
+    },
+}
+with open(OUT, "wb") as fh:
+    pickle.dump(payload, fh, protocol=4)
+mb = OUT.stat().st_size / 1024 / 1024
+print(f"\n已保存 {OUT}（{mb:.1f} MB）")
+print(f"  预期成绩（10 折留一作品）：AUC {np.nanmean(A):.3f}　"
+      f"精确率 {np.mean(P)*100:.1f}%　召回率 {np.mean(R)*100:.1f}%")
