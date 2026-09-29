@@ -198,7 +198,12 @@ def prec_rec(p, rs, topn=TOPN):
     cov = set(); gtot = 0
     gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
     for (rj, tk), cand in tc.items():
-        g = gt[rj][tk]; gtot += len(g)
+        # 人工标注可能来自没有官方标注的作品 —— 那种没有评估基准，跳过。
+        # （它们仍然参与训练，只是不能用来算精确率/召回率。）
+        g = gt.get(rj, {}).get(tk)
+        if g is None:
+            continue
+        gtot += len(g)
         for s, r in sorted(cand, key=lambda x: -x[0])[:topn]:
             nc += 1
             h = [x for x in g if abs(r["t"] - x) <= TOL]
@@ -209,10 +214,21 @@ def prec_rec(p, rs, topn=TOPN):
     return tp / max(1, nc), len(cov) / max(1, gtot)
 
 
+# 交叉验证只在**有官方标注**的作品上做。
+# 人工标注的作品没有完整标注（用户只标了模型给出的候选），算不了召回率，
+# 拿它当测试折没有意义 —— 所以它们始终留在训练集里。
+_gt = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))["gt"]
+works_gt = [w for w in works if w in _gt and any(r["track"] in _gt[w] for r in bywork[w])]
+extra = [w for w in works if w not in works_gt]
+if extra:
+    print(f"  ⚠ {len(extra)} 部作品只有人工标注、没有官方标注："
+          f"{', '.join(extra)}")
+    print(f"    它们参与训练，但不作为测试折（没有召回率基准）")
+
 print("\n10 折留一作品交叉验证（给出预期成绩 + 收集样本外预测用于校准）…")
 oof_raw, oof_lab = [], []
 A, P, R = [], [], []
-for hold in works:
+for hold in works_gt:
     tr = [r for r in rows if r["rj"] != hold]
     te = bywork[hold]
     m = fit(tr)
@@ -243,9 +259,9 @@ payload = {
     "iso": iso,
     "feats": MODEL_FEATS,
     "meta": {
-        "n_works": len(works), "n_tracks": len(tracks), "n_rows": len(rows),
+        "n_works": len(works_gt), "n_tracks": len(tracks), "n_rows": len(rows),
         "n_pos": sum(1 for r in rows if r["TP"]),
-        "works": works,
+        "works": works_gt, "works_extra": extra,
         "cv_auc": float(np.nanmean(A)), "cv_auc_std": float(np.nanstd(A)),
         "cv_prec": float(np.mean(P)), "cv_prec_std": float(np.std(P)),
         "cv_rec": float(np.mean(R)),
