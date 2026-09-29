@@ -698,11 +698,14 @@ button.ghost{background:transparent}
       <label class="muted">候选数
         <select id="topn"><option>3</option><option selected>6</option><option>10</option></select>
       </label>
-      <label class="muted">最低概率
+      <label class="muted" title="门槛越高误报越少、漏掉的越多。&#10;选项只列 isotonic 校准真实产生的台阶 —— 台阶之间的值行为完全相同，列了也没用。&#10;数字是 10 折留一作品的实测值（准=精确率，全=召回率，百分比）。">最低概率
         <select id="minp">
-          <option value="0">0</option><option value="0.3">30%</option>
-          <option value="0.5" selected>50%</option><option value="0.7">70%</option>
-          <option value="0.9">90%</option>
+          <option value="0">不过滤 · 准49/全75</option>
+          <option value="0.17">≥17% · 准61/全73</option>
+          <option value="0.25">≥25% · 准67/全69</option>
+          <option value="0.5" selected>≥50% · 准71/全68（F1 最优）</option>
+          <option value="0.66">≥66% · 准84/全55</option>
+          <option value="0.67">≥67% · 准92/全40</option>
         </select>
       </label>
       <button class="primary" id="go" disabled>分析高潮点</button>

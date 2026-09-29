@@ -64,7 +64,34 @@ ck("最高分事件排第一", r and r[0]["time"] == 100.0,
    " → ".join(x["mmss"] for x in r))
 
 print()
-print("  ⑥ 边界")
+print("  ⑦ 绝不凑数（质量优先原则）")
+print()
+# 只有 1 个候选够格时，就只给 1 个 —— 不能为了凑够 top=3 而塞低分候选
+r = merge_candidates([c(100, 0.95), c(500, 0.10), c(900, 0.05)], top=3, pool=3)
+ck("不会造出比输入更多的候选", len(r) <= 3, f"{len(r)} 个")
+# merge_candidates 本身不做门槛过滤（那是调用方上游的事），
+# 所以按真实调用顺序测：先过滤，再合并。
+# 契约是：**绝不为了凑够 top 个而塞低分候选**。
+
+
+def pipeline(raw, thr, top=3):
+    kept = [x for x in raw if x.get("probability", 0) >= thr]
+    return merge_candidates(kept, top=top, pool=top + 1)
+
+
+raw = [c(100, 0.95, 0.95), c(500, 0.20, 0.20), c(900, 0.10, 0.10)]
+ck("只有 1 个过门槛 → 只给 1 个", len(pipeline(raw, 0.5)) == 1,
+   f"{len(pipeline(raw, 0.5))} 个")
+ck("门槛放低 → 才给更多", len(pipeline(raw, 0.05)) == 3,
+   f"{len(pipeline(raw, 0.05))} 个")
+ck("不过滤时也不会超过 top",
+   len(pipeline([c(i * 100, 0.9, 0.9) for i in range(9)], 0.0, top=3)) == 3)
+# 一轨只有 1 个真高潮时输出 1 个就是对的 —— 不该硬凑到 3
+ck("两个高分且相距远 → 给 2 个",
+   len(pipeline([c(100, 0.95, 0.95), c(180, 0.90, 0.90)], 0.5)) == 2)
+
+print()
+print("  ⑧ 边界")
 ck("空输入返回空", merge_candidates([]) == [])
 ck("单元素", len(merge_candidates([c(5, 0.9)])) == 1)
 ck("top 限制生效", len(merge_candidates([c(i * 100, 0.9) for i in range(9)],

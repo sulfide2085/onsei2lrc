@@ -497,6 +497,15 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
 MERGE_GAP = 30.0        # 相距不超过此值的候选视为同一次高潮
 POOL_EXTRA = 1          # 只考察分数最高的 top + POOL_EXTRA 个
 
+# ml 模式的默认概率门槛。**质量优先：候选少就少给，不为了凑数塞低分候选。**
+# 实测（10 折留一作品；门槛比的是校准概率，与界面显示一致）：
+#     不过滤   精确 48.9%  召回 72.9%  每轨 1.87 个
+#     ≥30%    精确 67.0%  召回 67.2%  每轨 1.25 个
+#     ≥50%    精确 70.5%  召回 66.1%  每轨 1.17 个   ← 默认
+#     ≥60%    精确 84.2%  召回 55.0%  每轨 0.80 个
+#     ≥70%    精确 91.8%  召回 39.8%  每轨 0.51 个
+MIN_PROB = 0.5
+
 # ======================================================================================
 # 时间吸附：把选中的候选挪到附近能量最大的峰
 #
@@ -816,10 +825,13 @@ def _cli() -> int:
     ap.add_argument("--json", help="把结果写到 JSON")
     ap.add_argument("--acoustic-only", action="store_true", help="只用声学，不读转写")
     ap.add_argument("--cues", help="自定义线索规则文件（每行一个正则，# 开头为注释）")
-    ap.add_argument("-m", "--min-score", type=float, default=None,
-                    help="ml 模式：只输出校准概率不低于此值的候选（如 0.5）。"
-                         "formula 模式：只输出分数不低于此值的候选（如 +2.5）。"
-                         "不加则全输出并标置信度")
+    ap.add_argument("-m", "--min-score", type=float, default=None, metavar="V",
+                    help=f"ml 模式：校准概率门槛，默认 {MIN_PROB}（准 71%%/全 66%%）。"
+                         f"0 = 不过滤（准 49%%/全 73%%）；0.6 → 准 84%%/全 55%%；"
+                         f"0.7 → 准 92%%/全 40%%。"
+                         f"formula 模式：原始分门槛（建议 2.5）")
+    ap.add_argument("--all", action="store_true",
+                    help="不做门槛过滤，全部输出（等价于 -m 0）")
     ap.add_argument("--transcript-dir", "--asr-dir", action="append", default=[],
                     dest="transcript_dir", metavar="DIR",
                     help="转写文件所在目录（可重复；默认只在音频旁边找）")
@@ -855,6 +867,8 @@ def _cli() -> int:
         print(mobj.describe())
         print(f"  排序用集成原始分；显示的「校准概率」经 isotonic 校准，可直接当命中率读。")
         print(f"  轨级门槛 校准概率 {TRACK_MIN_PROB*100:.0f}%　最短时长 {MIN_DURATION:.0f}s")
+        lim = "不过滤" if not min_score else f"校准概率 ≥ {min_score*100:.0f}%"
+        print(f"  输出门槛 {lim}　每轨最多 {a.top} 个（够不着就少给，不凑数）")
     else:
         print(f"  评分 = {W_ACOUSTIC} × 声学(signature, recover) + {W_TXT} × 语义")
         print(f"  置信度门槛 {CONF_HIGH:+.1f}（以上实测精确率 54~64%）　"
@@ -862,10 +876,17 @@ def _cli() -> int:
         print("  ⚠ formula 是早期版本，10 折实测精确率仅 18.5% —— 仅供对照")
     print("=" * 78)
 
+    # 质量优先：ml 模式默认按校准概率过滤，不为了凑够 top 个而塞低分候选
+    min_score = a.min_score
+    if a.all:
+        min_score = 0.0
+    elif min_score is None and a.model == "ml":
+        min_score = MIN_PROB
+
     tdirs = [Path(d).expanduser() for d in a.transcript_dir]
     kw = dict(top=a.top, cues=cues, acoustic_only=a.acoustic_only,
               verbose=not a.quiet, transcript_dirs=tdirs or None,
-              min_score=a.min_score, model=a.model, model_obj=mobj,
+              min_score=min_score, model=a.model, model_obj=mobj,
               merge_gap=a.merge_gap, pool=a.pool, snap=a.snap)
     results = find_in_path(target, **kw)
 
