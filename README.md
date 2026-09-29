@@ -547,6 +547,8 @@ faster-whisper>=1.2   ctranslate2>=4.5   openai>=1.0   httpx   numpy   ffmpeg(�
 | `webui.py` | **WebUI**：拖拽导入 / 打包下载 / WAV→MP3（FastAPI + uvicorn，无额外依赖） |
 | `onsei2lrc.py` | 主程序（转写+翻译+LRC） |
 | `wav2mp3.py` | **可复用的音频转 MP3 工具**（库 + 命令行，单文件无第三方依赖），见第 10 节 |
+| `climax_finder.py` | **高潮（射精）候选点检测**（独立小工具），见第 11 节 |
+| `climax_cues_template.txt` | `climax_finder.py` 的线索规则模板，换作品时改它 |
 | `eval_compare.py` | 与参考 LRC 比对：行数、时间轴命中率、时间差、译文长度比 |
 | `tests/mock_openai_server.py` | 假 OpenAI 服务，用来在不启动模型的情况下测翻译链路 |
 | `webui_runs/` | WebUI 的上传与产出目录（可随时清空） |
