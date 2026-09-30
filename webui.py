@@ -481,6 +481,7 @@ def _rebuild_pairs(st: dict) -> None:
     audio_src: List[tuple] = []
     mp3_src: List[tuple] = []
     mp3_todo: List[tuple] = []
+    extras: List[tuple] = []
     src = Path(st["src_dir"]) if st.get("src_dir") else None
     if src and src.is_dir():
         existing = {p for p in src.rglob("*")
@@ -497,10 +498,15 @@ def _rebuild_pairs(st: dict) -> None:
                 mp3_src.append((twin, rel.with_suffix(".mp3").as_posix()))
             else:
                 mp3_todo.append((a, rel.with_suffix(".mp3").as_posix()))
+        # 封面/文档等：原样带上，不改名
+        for f in sorted(src.rglob("*")):
+            if f.is_file() and f.suffix.lower() not in AUDIO_EXTS and f.suffix.lower() != ".lrc":
+                extras.append((f, f.relative_to(src).as_posix()))
     st["lrc_pairs"] = lrc
     st["audio_src"] = audio_src
     st["mp3_src"] = mp3_src
     st["mp3_todo"] = mp3_todo
+    st["extras"] = extras
     st["zip_cache"] = {}
     st["name_map"] = None
     st["has_audio"] = bool(audio_src)
@@ -1123,6 +1129,21 @@ def run_pipeline(run_id: str) -> None:
         st["progress"]["files_done"] = len(audio)
         st["progress"]["done_dur"] = sum(st.get("durations", []))
 
+        # ---- 4b) 其余素材原样带上（封面 / 插图 / readme / Finishtime / .vtt …）----
+        # 打包只改**音频和歌词**的文件名；别的一律不改名、不转换，原封不动搬进包里。
+        # 以前这些被整个丢掉，出来的包缺封面和说明文档，一个作品集不完整。
+        extras: List[tuple] = []
+        for f in sorted(inp.rglob("*")):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() in AUDIO_EXTS or f.suffix.lower() == ".lrc":
+                continue                       # 音频和歌词走后面的重命名逻辑
+            rel = f.relative_to(inp)
+            rel = Path(*[p[:-9] if p.endswith("_unpacked") else p for p in rel.parts])
+            extras.append((f, rel.as_posix()))
+        if extras:
+            log_to(st, f"  （另有 {len(extras)} 个封面/文档等素材，原样放进包内）")
+
         # ---- 5) 登记下载素材（真正的打包在下载时按选项组合生成）----
         # 只登记 .lrc / .ja.lrc：.segments.json 是本工具的翻译缓存，不进任何下载包。
         lrc_pairs = [(s, n) for s, n in produced if n.lower().endswith(".lrc")]
@@ -1131,6 +1152,7 @@ def run_pipeline(run_id: str) -> None:
         st["audio_src"] = audio_src
         st["mp3_src"] = mp3_src
         st["mp3_todo"] = mp3_todo
+        st["extras"] = extras
         st["zip_cache"] = {}
         st["name_map"] = None
         st["has_audio"] = bool(audio_src)
@@ -1793,6 +1815,11 @@ def download(run_id: str, kind: str, ja: int = 1, mp3: int = 0, tr: int = 0):
                 pairs += [(s, rename(n)) for s, n in ready + conv]
             else:
                 pairs += [(s, rename(n)) for s, n in audio]
+            # 封面 / 插图 / readme / Finishtime / .vtt 等：原样进包，不改名
+            extras = list(st.get("extras") or [])
+            if extras:
+                log_to(st, f"[下载] 附上 {len(extras)} 个封面/文档等素材（保持原名）")
+            pairs += extras
             log_to(st, f"[下载] 正在打包 {len(pairs)} 个文件…")
         z = work / f"{kind}_{stamp}.zip"
         make_zip(pairs, z)

@@ -17,9 +17,18 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:7861"
-AUDIO_DIR = r"D:\库\音声\含高潮时间\RJ362169\01_mp3"
+def _paths():
+    """从 gt_all.json 取路径 —— 不要写死，作品目录和文件名都改过名"""
+    import json
+    meta = json.loads(
+        (Path(__file__).with_name("gt_all.json")).read_text(encoding="utf-8"))
+    fp = Path(meta["files"]["RJ362169"]["04"])
+    return str(fp.parent), fp.name
+
+
+AUDIO_DIR, AUDIO_NAME = _paths()
 LRC_DIR = r"D:\pyitme\onsei2lrc\_climax2\asr"
-AUDIO_NAME = "track04_没关系，我会用魔法来隐藏的…！.mp3"
+
 
 errors, checks = [], []
 

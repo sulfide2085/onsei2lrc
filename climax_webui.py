@@ -680,11 +680,92 @@ button.ghost{background:transparent}
 
 .muted{color:var(--dim);font-size:12px}
 #err{color:var(--hot);font-size:12px}
+
+/* ===================== 移动端 ===================== */
+#navbtn{display:none}
+#scrim{display:none}
+
+@media (max-width: 820px){
+  /* 单栏；用 dvh 而不是 vh —— 手机地址栏会盖住 100vh 的底部 */
+  #app{grid-template-columns:1fr;height:100dvh}
+
+  /* 侧栏改成从左滑出的抽屉 */
+  #side{
+    position:fixed;top:0;bottom:0;left:0;width:min(82vw,330px);z-index:60;
+    background:var(--bg);border-right:1px solid var(--line);
+    transform:translateX(-103%);transition:transform .22s cubic-bezier(.3,.8,.4,1);
+    box-shadow:0 0 44px rgba(0,0,0,.6);will-change:transform;
+  }
+  #side.open{transform:none}
+  #scrim{
+    display:block;position:fixed;inset:0;z-index:55;background:rgba(0,0,0,.55);
+    opacity:0;pointer-events:none;transition:opacity .2s;
+  }
+  #scrim.on{opacity:1;pointer-events:auto}
+
+  /* 汉堡按钮 */
+  #navbtn{display:inline-flex;align-items:center;justify-content:center;
+    width:40px;height:36px;flex:none;font-size:17px;line-height:1;padding:0}
+
+  /* 顶栏：允许换行，标题独占一行 */
+  #top{padding:9px 11px;gap:7px}
+  #title{flex:1 1 100%;font-size:15px;white-space:normal;line-height:1.35}
+  #err{flex:1 1 100%}
+  #fbstats{display:none}          /* 手机上不显示这块统计 */
+
+  #stage{padding:11px 11px 44px}
+
+  /* 触控目标放大 */
+  button{padding:9px 13px;border-radius:8px}
+  .row{padding:11px 14px;font-size:15px}
+  .row .mt{font-size:12px}
+  #crumbs{padding:9px 12px}
+
+  /* 输入框 >=16px，否则 iOS 聚焦时会自动放大整页 */
+  #pinput{font-size:16px;padding:9px 11px}
+  input,select,textarea{font-size:16px}
+  #rate{padding:8px 9px}
+
+  /* 时间轴加高，手指才好点 */
+  #tl{height:78px}
+  .mk{width:4px}
+  .mk.hi{width:6px}
+  .mk.user{width:6px}
+  #tl .lab{font-size:11px}
+
+  #ctrl{gap:8px;margin:11px 0 15px}
+  #ctrl .sp{display:none}          /* 手机上不需要这个弹性占位 */
+  #vol{width:100%;order:9}         /* 音量条独占一行 */
+
+  /* 候选行：加大点击区 */
+  .hit{padding:11px 12px;gap:9px;flex-wrap:wrap}
+  .hit .t{min-width:50px;font-size:15px}
+  .hit .p{min-width:48px}
+  .hit .x{flex:1 1 100%;font-size:12px}
+  .hit .vb{flex:1 1 100%;justify-content:flex-end}
+  .hit .vb button{padding:7px 15px;font-size:15px}
+
+  .card{padding:12px 13px;margin-bottom:12px}
+  h2{font-size:14px}
+
+  #banner{top:auto;bottom:26px;padding:12px 22px}
+  #toast{left:11px;right:11px;transform:translateY(-140%)}
+  #toast.on{transform:none}
+}
+
+/* 横屏且很矮时，进一步压缩 */
+@media (max-width: 820px) and (max-height: 460px){
+  #tl{height:52px}
+  #top{padding:6px 10px}
+  #title{font-size:13px}
+}
 </style>
 </head>
 <body>
 <div id="app">
   <aside id="side">
+    <button id="navclose" class="ghost" title="收起"
+            style="display:none;position:absolute;top:8px;right:8px;z-index:2">✕</button>
     <div id="pick">
       <input id="pinput" spellcheck="false" placeholder="输入或粘贴路径，回车打开">
     </div>
@@ -692,8 +773,10 @@ button.ghost{background:transparent}
     <div id="listing"></div>
   </aside>
 
+  <div id="scrim"></div>
   <section id="main">
     <div id="top">
+      <button id="navbtn" title="选择文件">☰</button>
       <div id="title">未选择文件</div>
       <label class="muted">候选数
         <select id="topn"><option>3</option><option selected>6</option><option>10</option></select>
@@ -767,6 +850,24 @@ button.ghost{background:transparent}
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
+
+/* ---------------- 移动端抽屉 ---------------- */
+const _mq = window.matchMedia('(max-width: 820px)');
+function isMobile(){ return _mq.matches; }
+function drawer(open){
+  if (!isMobile()){ $('side').classList.remove('open'); $('scrim').classList.remove('on');
+    $('navclose').style.display='none'; document.body.style.overflow=''; return; }
+  $('side').classList.toggle('open', open);
+  $('scrim').classList.toggle('on', open);
+  $('navclose').style.display = open ? 'inline-flex' : 'none';
+  // 抽屉打开时锁住背景滚动，否则手指会滑到后面的列表
+  document.body.style.overflow = open ? 'hidden' : '';
+}
+$('navbtn').onclick = () => drawer(true);
+$('navclose').onclick = () => drawer(false);
+$('scrim').onclick = () => drawer(false);
+window.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false); });
+_mq.addEventListener('change', () => drawer(false));
 const au = $('au');
 let cur = null;              // 当前音频路径
 let curPath = '';            // 当前浏览的目录

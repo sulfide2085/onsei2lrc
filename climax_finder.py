@@ -155,7 +155,14 @@ def _smooth(a: np.ndarray, k: int) -> np.ndarray:
 
 
 def energy_envelope(x: np.ndarray) -> Tuple[np.ndarray, float]:
-    """逐帧 RMS（dBFS），帧长 WIN、步长 HOP。"""
+    """逐帧 RMS（dBFS），帧长 WIN、步长 HOP。
+
+    **必须先转 float64。** 解码器给的是 float32，而 np.mean 会沿用输入的
+    dtype 做累加 —— float32 累加 1600 个数会累积舍入误差，实测让全轨中位数
+    偏 0.03 dB，进而让候选峰从 74 个变成 70 个。离线 JS 版用的是 float64，
+    两边对不上就是从这里开始的。
+    """
+    x = np.asarray(x, dtype=np.float64)
     step, wlen = int(SR * HOP), int(SR * WIN)
     n = max(1, (len(x) - wlen) // step)
     out = np.empty(n)
@@ -275,7 +282,9 @@ def model_features(x: np.ndarray, s: np.ndarray, hop: float, i: int,
 
     # ---- 频谱（实测重要性低，但保留——删掉会略降指标） ----
     step = int(hop * SR)
-    seg = x[max(0, i - int(0.5 / hop)) * step:min(len(x), i + int(0.5 / hop)) * step]
+    seg = np.asarray(
+        x[max(0, i - int(0.5 / hop)) * step:min(len(x), i + int(0.5 / hop)) * step],
+        dtype=np.float64)
     if len(seg) > 512:
         seg = seg - seg.mean()
         f["zcr"] = float((np.diff(np.sign(seg)) != 0).mean())
@@ -373,7 +382,7 @@ def load_transcript(audio: Path, extra_dirs: Optional[List[Path]] = None) -> Opt
     """找转写：先看音频旁边，再看 extra_dirs。优先 .segments.json，其次 .lrc。
 
     支持在 extra_dirs 里用「名字包含」匹配——ASR 输出常带前缀/后缀
-    （如 `track01_童贞君与小穴值日生同学.segments.json`），而音频名可能被改过。
+    （如 `track01_<轨名>.segments.json`），而音频名可能被改过。
     """
     dirs = [audio.parent] + list(extra_dirs or [])
     for d in dirs:
@@ -458,7 +467,8 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
     except FileNotFoundError:
         p = None
     if p is not None and p.returncode == 0 and p.stdout:
-        return np.frombuffer(p.stdout, dtype=np.float32).copy()
+        # 转 float64：整条链路统一精度，也便于和离线 JS 版对齐
+        return np.frombuffer(p.stdout, dtype=np.float32).astype(np.float64)
 
     # 没有 ffmpeg（或该文件 ffmpeg 解不开）→ 退回 PyAV
     try:
@@ -478,7 +488,7 @@ def decode_audio_mono(path: Path, sr: int = SR) -> np.ndarray:
     gc.collect()      # 不手动回收会漏（faster-whisper#390）
     if not chunks:
         raise RuntimeError("解码结果为空")
-    return np.concatenate(chunks).astype(np.float32)
+    return np.concatenate(chunks).astype(np.float64)
 
 
 # ======================================================================================

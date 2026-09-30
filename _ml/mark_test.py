@@ -10,7 +10,16 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:7861"
-AU = r"D:\库\音声\含高潮时间\RJ362169\01_mp3\track04_没关系，我会用魔法来隐藏的…！.mp3"
+def _audio():
+    """从 gt_all.json 取音频路径 —— 不要写死：作品目录和音频文件名都改过名，
+    写死的路径会失效（这个测试就是这么挂掉的）。"""
+    import json
+    meta = json.loads(
+        (Path(__file__).with_name("gt_all.json")).read_text(encoding="utf-8"))
+    return meta["files"]["RJ362169"]["04"]
+
+
+AU = _audio()
 MARKS = Path(r"D:\pyitme\onsei2lrc\climax_marks.jsonl")
 DONE = Path(r"D:\pyitme\onsei2lrc\climax_tracks_done.jsonl")
 checks, errors = [], []

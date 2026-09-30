@@ -83,6 +83,7 @@ def build_dataset():
     from faster_whisper import decode_audio
     meta = json.loads((ROOT / "_ml" / "gt_all.json").read_text(encoding="utf-8"))
     GT, FILES = meta["gt"], meta["files"]
+    SEGS = meta.get("segs", {})        # 转写路径（按轨号重定位过，见 fix_paths.py）
     # 用户手动标注的（已标完）音轨也要提特征 —— 它们可能不在原来 10 部里
     u_gt, u_files = load_user_gt()
     for rj, trks in u_gt.items():
@@ -98,15 +99,27 @@ def build_dataset():
                 continue
             mp3 = Path(fp)
             segs = None
-            for d in (asrdir, mp3.parent, ASR_ML / rj):
-                if not d.exists():
-                    continue
-                c = list(d.glob(f"{mp3.stem}.segments.json"))
-                if c:
-                    segs = json.loads(c[0].read_text(encoding="utf-8"))["segments"]
-                    break
+            # ① 先用 gt_all.json 里按轨号重定位好的路径
+            sp = SEGS.get(rj, {}).get(tk)
+            if sp and Path(sp).exists():
+                try:
+                    segs = json.loads(Path(sp).read_text(encoding="utf-8"))["segments"]
+                except Exception:
+                    segs = None
+            # ② 退回到按音频文件名找
+            if segs is None:
+                for d in (asrdir, mp3.parent, ASR_ML / rj):
+                    if not d.exists():
+                        continue
+                    c = list(d.glob(f"{mp3.stem}.segments.json"))
+                    if c:
+                        segs = json.loads(c[0].read_text(encoding="utf-8"))["segments"]
+                        break
+            if segs is None:
+                print(f"    · {rj}/{tk} 无转写（txt 特征按 0 处理）")
             try:
-                x = decode_audio(str(mp3), sampling_rate=SR)
+                # 转 float64：与 climax_finder.energy_envelope 的精度保持一致
+                x = decode_audio(str(mp3), sampling_rate=SR).astype(np.float64)
             except Exception as e:
                 print(f"  ✗ {rj}/{tk}: {e}")
                 continue

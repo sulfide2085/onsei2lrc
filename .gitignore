@@ -55,3 +55,39 @@ glossary*.txt
 !glossary_template.txt
 my_glossary*.txt
 asr_fixes.txt
+
+# 离线版：大文件不入库（都能从 climax_model.pkl 重新生成）
+_offline/model.json
+_offline/model.json.gz
+_offline/ref_audio.f32
+_offline/ref_env.npy
+_offline/*.png
+_offline/高潮点分析.html
+
+# 之前会话遗留的 ASR 模型对比实验（含第三方模型文件，不入库）
+_cmp/
+_cmp_chickenrice/
+# 中间缓存，随时可重算
+_ml/_final_oof2.pkl
+_ml/_prob_oof.pkl
+_ml/_thr_oof.pkl
+_ml/_oof_*.pkl
+_ml/_ablate_oof.pkl
+
+# 调试产物
+_offline/ref_out.json
+_offline/js_*.json
+_ml/gt_all.json.bak
+_shot_*.png
+
+# 人工标注数据：含本机绝对路径与日文轨名，不入公开仓库
+climax_feedback.jsonl
+climax_feedback.DEPRECATED.jsonl
+climax_marks.jsonl
+climax_tracks_done.jsonl
+
+# 含本机绝对路径与作品名，不入公开仓库
+_shot_player.png
+
+# 含本机绝对路径与作品名，不入公开仓库
+_ml/gt_all.json
