@@ -34,7 +34,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -70,8 +70,16 @@ RUNS_LOCK = threading.Lock()
 # --------------------------------------------------------------------------------------
 
 def log_to(st: dict, msg: str) -> None:
+    """写日志。时间戳在这里统一加 —— 流水线子进程的输出只有内容没有时刻，
+    事后想回答「哪一步慢、等了多久」就只能靠它。
+
+    多行消息按行拆开，每行各自带前缀；空行保留（当分隔用），不加前缀。
+    """
+    ts = time.strftime("[%H:%M:%S] ")
+    parts = msg.rstrip("\n").split("\n")
     with RUNS_LOCK:
-        st["log"].append(msg)
+        for ln in parts:
+            st["log"].append((ts + ln) if ln.strip() else "")
         if len(st["log"]) > 5000:            # 丢弃最旧的 1000 行，但用 offset 保住绝对行号，
             del st["log"][:1000]             # 否则前端传上来的 since 会错位
             st["log_offset"] = st.get("log_offset", 0) + 1000
@@ -331,6 +339,10 @@ def build_cmd(inp: Path, out: Path, o: dict) -> List[str]:
         cmd += ["--fix-asr", o["fix_path"]]
     backend = o["backend"]
     model = o.get("model_name") or "sakura"
+    # 显存编排交给流水线自己：翻译阶段它才加载 Sakura、译完（含文件名）再卸载。
+    # 这样 ASR 阶段显存里只有 whisper，不会出现「两个模型同时驻留把 8 GB 撑爆 → 换页降频」。
+    if backend == "lmstudio":
+        cmd += ["--manage-backend", "--translate-names"]
     if backend == "lmstudio":
         cmd += ["--preset", "lmstudio", "--model-name", model]
     elif backend == "llamacpp":
@@ -372,86 +384,31 @@ def make_zip(pairs, zpath: Path) -> None:
 
 # --------------------------------------------------------------------------------------
 # 文件名翻译（下载时的可选项）
+#
+# 实现已挪到 onsei2lrc.py：那样才能赶上「Sakura 还在显存里」的翻译阶段顺手做掉，
+# 不必为了几个文件名再把 6 GB 模型加载一次。这里只留一个薄适配层给下载用。
 # --------------------------------------------------------------------------------------
-
-_NAME_PROMPT = (
-    "把下面的日文音频文件名逐行翻译成简体中文。要求：\n"
-    "1. 输出行数必须与输入完全一致，一行一个，不要合并或拆分\n"
-    "2. 编号与章号**原样照抄**：「第1章」就是「第1章」，不要改成「序章1」或「第一章」；\n"
-    "   括号与分隔符（『』 / 【】）也保留\n"
-    "3. 译名要简洁，像文件名而不是句子；不要加引号、序号或任何解释\n"
-    "4. 逐词直译，不要省略或概括（长词就完整译出，不要缩写成更短的近义词）\n"
-    "5. 这些是音声作品的固定用语，必须按此翻译：\n"
-    "   トラック = 音轨（**不是「卡车」**）；パート = part；プロローグ = 序章；\n"
-    "   エピローグ = 尾声；添い寝 = 陪睡；おまけ = 附赠；本編 = 正篇\n"
-    "6. 人名一律保留原文汉字：「零」「舞」这类单字名不要当成数字或普通词翻译\n"
-    "7. 数字与英文字母一律用半角（4 而不是 ４）"
-)
-
-# 全角 → 半角（模型偶尔会输出全角数字/字母，文件名里会显得很怪）
-_FULLWIDTH = str.maketrans(
-    "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
-    "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
-    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
-
-# 文件名开头的编号：第2-2章 / 第1章 / 03 / 2-1 …
-_PREFIX_RE = re.compile(
-    r"^\s*(第\s*[0-9０-９]+\s*(?:[-－ー][0-9０-９]+)?\s*[章話回]"
-    r"|[0-9０-９]+\s*(?:[-－ー][0-9０-９]+)?)")
-
-
-def _keep_prefix(orig: str, trans: str) -> str:
-    """确保译文保留原名的编号前缀。
-
-    模型很爱把「第1章…プロローグ…」整条改写成「序章…」——编号一丢，
-    文件排序就乱了。编号是结构信息不是内容，这里用确定性规则兜住。
-    """
-    m = _PREFIX_RE.match(orig)
-    if not m:
-        return trans
-    pre = m.group(1).strip().translate(_FULLWIDTH)
-    if not pre:
-        return trans
-    head = trans.translate(_FULLWIDTH)[:len(pre) + 4]
-    return trans if pre in head else f"{pre} {trans}"
-
-
-def _balance(s: str) -> str:
-    """补齐模型漏掉的右括号。
-
-    实测模型会把「第2章　『お寺内』」译成「第2章 『寺庙里」——左括号留着，
-    右括号丢了。括号是结构信息，用确定性规则补齐。
-    """
-    for l, r in (("『", "』"), ("「", "」"), ("【", "】"), ("（", "）"), ("《", "》")):
-        n = s.count(l) - s.count(r)
-        if n > 0:
-            s += r * n
-    return s
-
-
-def _clean_name(s: str) -> str:
-    """清掉模型可能带上的序号/引号，并做 Windows 文件名安全化。"""
-    s = s.strip().strip('"\'“”')
-    s = re.sub(r"^\s*\d+\s*[.、):：]\s*", "", s)          # 去掉 "1. " / "1、"
-    s = s.translate(_FULLWIDTH)                           # ４ → 4
-    s = _balance(s)                                       # 补右括号
-    s = s.replace("　", " ")                              # 全角空格在部分工具里会出问题
-    s = re.sub(r'[\\/:*?"<>|]', "", s)                    # Windows 非法字符
-    s = re.sub(r"\s+", " ", s).strip().rstrip(". ")       # 结尾的点和空格 Windows 不允许
-    if s.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL",
-                                   *[f"COM{i}" for i in range(1, 10)],
-                                   *[f"LPT{i}" for i in range(1, 10)]}:
-        s = "_" + s
-    return s[:120] or "unnamed"
-
 
 def translate_filenames(stems: List[str], o: dict, st: dict) -> dict:
     """把音频文件名（不含扩展名）翻译成中文。返回 {原名: 译名}。
 
-    下载时才触发，复用与流水线相同的后端配置；顺带把术语表也带上，
-    这样文件名里的术语译法能跟正文保持一致。
+    优先用流水线在翻译阶段顺手产出的 `<outdir>/_filenames.json`——
+    那时候 Sakura 本来就在显存里，等于白捡；这里再去调模型反而要重新
+    加载一次 6 GB 的模型。只有拿不到缓存（老任务 / 上传模式）才自己翻。
     """
     import onsei2lrc as P                                  # 顶层只有标准库，import 很快
+
+    cached = P.filenames_json_path((st.get("dir") or Path(".")) / "output")
+    if cached.is_file():
+        try:
+            nm = json.loads(cached.read_text(encoding="utf-8"))
+            hit = {s: nm[s] for s in stems if s in nm}
+            if hit:
+                log_to(st, f"[文件名] 复用流水线译名 {len(hit)}/{len(stems)} 个（免去重新加载模型）")
+                return hit
+            log_to(st, "[文件名] 流水线译名对不上本次文件，改为现翻")
+        except Exception as e:
+            log_to(st, f"[文件名] 读译名缓存失败（{type(e).__name__}: {e}），改为现翻")
 
     preset = {"lmstudio": "lmstudio", "llamacpp": "sakura-llamacpp",
               "ollama": "sakura-ollama", "deepseek": "deepseek"}.get(o.get("backend"))
@@ -462,65 +419,8 @@ def translate_filenames(stems: List[str], o: dict, st: dict) -> dict:
         cfg["model_name"] = o["model_name"]
     if o.get("api_key"):
         cfg["api_key"] = o["api_key"]
-    if not cfg.get("base_url"):
-        log_to(st, "[文件名] 后端不支持，跳过翻译文件名")
-        return {}
-
-    # _make_client / _chat 需要的字段全部显式给默认值，缺一个就会 AttributeError。
-    # 采样温度必须显式压低：文件名翻译是「翻译」不是「创作」，
-    # 用服务端默认温度（通常 0.8）实测同一批跑两遍有 85% 的条目不一样，纯噪声。
-    args = argparse.Namespace(
-        base_url=cfg.get("base_url"),
-        api_key=cfg.get("api_key") or "",
-        timeout=cfg.get("timeout", 180.0),
-        model_name=cfg.get("model_name") or "sakura",
-        protocol=cfg.get("protocol", "sakura"),
-        max_tokens=cfg.get("max_tokens", 2048),
-        temperature=0.2, top_p=0.9, frequency_penalty=0.0,
-    )
-    client = P._make_client(args)
-
-    system = _NAME_PROMPT
-    gl = (o.get("glossary_text") or "").strip()
-    if gl:
-        # 只取规则行，去掉注释，免得把说明文字也喂进去
-        rules = [l for l in gl.splitlines() if l.strip() and not l.strip().startswith("#")]
-        if rules:
-            system += "\n\n参考术语表（务必遵守）：\n" + "\n".join(rules[:40])
-
-    out: dict = {}
-    B = 10                                                 # 一次 10 条，行数对齐更稳
-    for i in range(0, len(stems), B):
-        chunk = stems[i:i + B]
-        msgs = [{"role": "system", "content": system},
-                {"role": "user", "content": "\n".join(chunk)}]
-        got = None
-        for _ in range(3):                                 # 行数不匹配就重发，最多 3 次
-            try:
-                txt = P._chat(client, args, msgs)
-            except Exception as e:
-                log_to(st, f"[文件名] 调用失败：{type(e).__name__}: {e}")
-                break
-            lines = [x for x in (txt or "").splitlines() if x.strip()]
-            if len(lines) == len(chunk):
-                got = lines
-                break
-        if got:
-            for src, dst in zip(chunk, got):
-                out[src] = _keep_prefix(src, _clean_name(dst))
-        else:
-            log_to(st, f"[文件名] 第 {i//B+1} 批对齐失败，这批保留原名")
-    # 去重：译名撞车时补序号，否则后一个会覆盖前一个
-    seen: dict = {}
-    for k, v in out.items():
-        base, n = v, 2
-        while v in seen:
-            v = f"{base} ({n})"
-            n += 1
-        seen[v] = k
-        out[k] = v
-    log_to(st, f"[文件名] 已翻译 {len(out)}/{len(stems)} 个文件名")
-    return out
+    cfg["glossary_text"] = o.get("glossary_text") or ""
+    return P.translate_filenames(stems, cfg, log_cb=lambda m: log_to(st, m))
 
 
 # --------------------------------------------------------------------------------------
@@ -661,21 +561,37 @@ _WAITING: Optional[str] = None           # 正卡在队首等翻译后端的 run
 _WORKER: Optional[threading.Thread] = None
 
 
-def _backend_ready(o: dict) -> Tuple[bool, str]:
-    """开跑前确认翻译后端在线、且目标模型已加载。
-
-    实测教训：LM Studio 的模型可能被卸载（空闲自动 eject / 手动 unload），
-    此时队列里每个任务都会完整跑完 ASR 才在翻译那步失败——几小时白跑。
-    这里用 2 秒超时探一下，把任务留在队首等后端回来。
-    """
-    import httpx
+def _backend_base(o: dict) -> str:
+    """解析翻译后端的 base_url：预设优先，其次用户自定义的那个。"""
     preset = {"lmstudio": "lmstudio", "llamacpp": "sakura-llamacpp",
               "ollama": "sakura-ollama", "deepseek": "deepseek"}.get(o.get("backend"))
     if preset:
         import onsei2lrc as P
-        base = o.get("base_url") or (P.PRESETS.get(preset) or {}).get("base_url")
-    else:
-        base = o.get("base_url")            # 自定义后端
+        return o.get("base_url") or (P.PRESETS.get(preset) or {}).get("base_url") or ""
+    return o.get("base_url") or ""
+
+
+def _probe_backend(base: str, timeout: float = 2.0) -> bool:
+    """端口探活：HTTP 200 就算服务在跑（不看模型有没有加载）。"""
+    if not base:
+        return False
+    import httpx
+    try:
+        return httpx.get(base.rstrip("/") + "/models", timeout=timeout,
+                         trust_env=False).status_code == 200
+    except Exception:
+        return False
+
+
+def _backend_ready(o: dict, require_model: bool = True) -> Tuple[bool, str]:
+    """确认翻译后端可用。
+
+    require_model=False 只确认「服务在跑」——因为流水线现在自己管模型的
+    加载/卸载（见 onsei2lrc.py 的 --manage-backend）：ASR 阶段 Sakura 本来
+    就该是不在显存里的，这时候要求「模型已加载」会把任务永远卡在队首。
+    """
+    import httpx
+    base = _backend_base(o)
     if not base:
         return True, ""                     # 判断不了就放行，别挡着
     try:
@@ -684,6 +600,8 @@ def _backend_ready(o: dict) -> Tuple[bool, str]:
         return False, f"翻译后端连不上（{type(e).__name__}）"
     if r.status_code != 200:
         return False, f"翻译后端返回 HTTP {r.status_code}"
+    if not require_model:
+        return True, ""
     try:
         ids = [m.get("id") for m in (r.json().get("data") or [])]
     except Exception:
@@ -692,6 +610,208 @@ def _backend_ready(o: dict) -> Tuple[bool, str]:
     if want and ids and want not in ids:
         return False, f"后端在线但没加载模型 {want}（现有：{', '.join(ids[:3])}）"
     return True, ""
+
+
+def _needs_model_ready(o: dict) -> bool:
+    """这一跑是不是还需要「模型已经加载」才算就绪。
+
+    LM Studio + --manage-backend 的跑法由流水线在翻译阶段自己 load，
+    所以队首检查只确认服务在跑。其它后端（llama.cpp / Ollama / DeepSeek）
+    是常驻的，仍然要检查模型。
+    """
+    return (o.get("backend") or "lmstudio") != "lmstudio"
+
+
+# --------------------------------------------------------------------------------------
+# 拉起翻译后端（LM Studio）
+#
+# 为什么要有这一块：LM Studio 的模型会被**外部**弄掉——空闲 TTL 自动 eject、
+# 或者另一个项目跑 `lms load` 把当前模型挤下去（LM Studio 同一时刻只驻留一个）。
+# 之前只会「等」，等待期间流水线照跑 ASR，每一轨都白烧几分钟到几十分钟。
+# 现在改成「先自己拉起来，拉不动再等」。
+#
+# 实测注意：`lms` 只是客户端，它叫不醒 LM Studio 守护进程
+# （会打印 "Waking up LM Studio service..." 然后 60 秒超时），
+# 所以必须先把桌面程序拉起来，再 `lms server start` / `lms load`。
+# --------------------------------------------------------------------------------------
+
+# 标识符 → LM Studio 模型键。定义在 onsei2lrc.py（流水线 load 模型时也要用），
+# 这里只做转发，别在两处各维护一份。
+def _model_keys() -> dict:
+    import onsei2lrc as P
+    return dict(P.MODEL_KEY_HINTS)
+
+AUTO_START_BACKEND = True       # 队列等待 / 运行中后端掉线时，自动尝试拉起
+_BACKEND_COOLDOWN = 90.0        # 同一个任务两次自动拉起之间的最小间隔（秒）
+_BACKEND_TRIES: Dict[str, float] = {}
+_LOCATE: Dict[str, Optional[str]] = {"lms": None, "app": None, "lms_done": False, "app_done": False}
+
+if os.name == "nt":
+    _NO_WINDOW = subprocess.CREATE_NO_WINDOW
+    _DETACHED = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+else:
+    _NO_WINDOW = 0
+    _DETACHED = 0
+
+
+def _find_lms() -> Optional[str]:
+    """定位 lms 命令行。实现共用 onsei2lrc.py 的那份，避免两处各写一遍。
+
+    流水线自己也要 load/unload 模型（--manage-backend），不能只有 WebUI 认识 lms。
+    """
+    import onsei2lrc as P
+    return P.find_lms()
+
+
+def _find_lmstudio_app() -> Optional[str]:
+    """定位 LM Studio 桌面程序。
+
+    不能写死安装路径——本机就装在 D:\\LM_Studio 而不是默认的 %LOCALAPPDATA%。
+    优先读注册表卸载项里的 DisplayIcon（跟着用户实际装在哪），再退回常见位置。
+    """
+    if _LOCATE["app_done"]:
+        return _LOCATE["app"]
+    _LOCATE["app_done"] = True
+    cands: List[str] = []
+    if os.name == "nt":
+        try:
+            import winreg
+            subs = ((winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                    (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"))
+            for hive, sub in subs:
+                try:
+                    with winreg.OpenKey(hive, sub) as k:
+                        for i in range(winreg.QueryInfoKey(k)[0]):
+                            try:
+                                with winreg.OpenKey(k, winreg.EnumKey(k, i)) as sk:
+                                    if "LM Studio" not in str(winreg.QueryValueEx(sk, "DisplayName")[0]):
+                                        continue
+                                    icon = str(winreg.QueryValueEx(sk, "DisplayIcon")[0])
+                                    cands.append(icon.split(",")[0].strip().strip('"'))
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+        except Exception:
+            pass
+        for root in (os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramFiles")):
+            if root:
+                cands += [str(Path(root) / "Programs" / "LM Studio" / "LM Studio.exe"),
+                          str(Path(root) / "LM Studio" / "LM Studio.exe")]
+    else:
+        cands.append("/Applications/LM Studio.app/Contents/MacOS/LM Studio")
+    for c in cands:
+        try:
+            if c and c.lower().endswith(".exe") and Path(c).is_file():
+                _LOCATE["app"] = c
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _run_lms(argv: List[str], timeout: float = 180.0) -> Tuple[int, str]:
+    """跑一条 lms 命令。共用 onsei2lrc.py 的实现（流水线也要调 lms）。"""
+    import onsei2lrc as P
+    return P.run_lms(argv, timeout)
+
+
+def _launch_app(path: str) -> str:
+    """启动 LM Studio 桌面程序，返回实际用的方式（用于日志）。
+
+    为什么不是一句 subprocess.Popen 就完事（实测踩到的坑）：
+    如果本服务本身是被别的进程以 job object 托管起来的（被上层工具/沙箱拉起时
+    很常见），Popen 出来的 LM Studio 会在 2 秒内**静默退出**——退出码 0 或 9，
+    自己的 main.log 一行都不写，看起来就像「拉不起来」。
+    同一个上下文里改用 WMI 的 Win32_Process.Create 就正常：WMI 由 WmiPrvSE 代建进程，
+    不受父进程 job 约束。所以 Windows 上优先走 WMI，失败再退回 Popen。
+    """
+    if os.name == "nt":
+        import base64
+        ps = ('$r = ([wmiclass]"Win32_Process").Create(\'"%s"\'); exit $r.ReturnValue' % path)
+        try:
+            enc = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+            p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                               capture_output=True, timeout=90, creationflags=_NO_WINDOW)
+            if p.returncode == 0:
+                return "WMI"
+        except Exception:
+            pass
+    subprocess.Popen([path], cwd=str(Path(path).parent), creationflags=_DETACHED,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    return "Popen"
+
+
+def start_backend(o: dict, log_cb=None, load_model: bool = True) -> Tuple[bool, str]:
+    """把翻译后端拉起来（LM Studio）。
+
+    顺序：已就绪 → 拉桌面程序 → lms server start →（可选）lms load --identifier → 等就绪。
+    load_model=False 只保证「服务在跑」——流水线自己管模型的时候用这个，
+    免得在 ASR 阶段就把 6 GB 的 Sakura 塞进显存，正好抵消分时复用的意义。
+    全程不抛异常；每一步都通过 log_cb 汇报，失败也返回人话原因。
+    """
+    say = log_cb or (lambda _m: None)
+    if (o.get("backend") or "lmstudio") != "lmstudio":
+        return False, "只有 LM Studio 支持由本工具拉起（其它后端请自行常驻）"
+    base = _backend_base(o)
+    if not base:
+        return False, "没有配置后端地址，无法拉起"
+
+    if _probe_backend(base) and (not load_model or _backend_ready(o)[0]):
+        return True, "后端已就绪"
+
+    m = re.search(r":(\d+)", base)
+    port = int(m.group(1)) if m else 1234
+
+    # ① 先把 LM Studio 本体拉起来（lms 自己叫不醒守护进程）
+    if not _probe_backend(base):
+        app = _find_lmstudio_app()
+        if not app:
+            return False, "找不到 LM Studio 程序，请手动启动它（或确认已正确安装）"
+        say(f"[后端] 启动 LM Studio：{app}")
+        try:
+            how = _launch_app(app)
+            say(f"[后端] 已启动（{how}），等 HTTP 服务就绪…")
+        except Exception as e:
+            return False, f"启动 LM Studio 失败：{type(e).__name__}: {e}"
+        say("[后端] 等待 HTTP 服务就绪…")
+        for _ in range(45):                     # 冷启动实测 20~60 秒
+            time.sleep(2)
+            if _probe_backend(base):
+                break
+        else:
+            return False, "LM Studio 起来了但 HTTP 服务没响应（在 LM Studio 里确认已开启开发者服务器）"
+
+    # ② 让服务器监听（幂等；已经在跑会立刻返回）
+    rc, out = _run_lms(["server", "start", "--port", str(port)], timeout=120)
+    if rc != 0:
+        say(f"[后端] lms server start 返回 {rc}：{out[:200]}")
+
+    if not load_model:
+        return True, "服务已就绪（模型由流水线在翻译阶段自己加载）"
+
+    # ③ 加载模型
+    ident = (o.get("model_name") or "").strip()
+    if not ident:
+        return False, "没填模型名，无法拉起"
+    key = _model_keys().get(ident, ident)
+    say(f"[后端] 加载模型 {key}（API 标识符 {ident}）…首次加载 6 GB 模型要 30~90 秒")
+    rc, out = _run_lms(["load", key, "--gpu", "max", "--context-length", "8192",
+                        "--identifier", ident, "-y"], timeout=420)
+    if rc != 0:
+        tail = out[-300:] if out else "(无输出)"
+        return False, f"lms load 失败（返回码 {rc}）：{tail}"
+
+    # ④ 等标识符真的出现在 /v1/models 上
+    for _ in range(30):
+        ok, why = _backend_ready(o)
+        if ok:
+            say(f"[后端] ✅ 就绪：{ident}")
+            return True, f"已就绪（{ident}）"
+        time.sleep(2)
+        last = why
+    return False, f"load 命令已返回，但 {ident} 仍未就绪：{last}"
 
 
 def _ensure_worker() -> None:
@@ -723,12 +843,24 @@ def _queue_worker() -> None:
                 if QUEUE and QUEUE[0] == rid:
                     QUEUE.pop(0)
             continue
-        ok, why = _backend_ready(st.get("options") or {})
+        o = st.get("options") or {}
+        # LM Studio 的跑法里模型由流水线在翻译阶段自己加载，队首只确认「服务在跑」；
+        # 其它常驻后端仍然要求模型已加载。
+        ok, why = _backend_ready(o, require_model=_needs_model_ready(o))
         if not ok:
             _WAITING = rid                        # 让前端能显示「等待翻译后端」
             if not st.get("_waiting"):
                 st["_waiting"] = True
-                log_to(st, f"[等待] {why} —— 队列暂停，每 20 秒重试")
+                log_to(st, f"[等待] {why} —— 先尝试自动拉起，失败则每 20 秒重试")
+            # 自动拉起（带冷却）。这里只保证服务在跑，不预加载模型——
+            # 模型由流水线在翻译阶段 load，ASR 阶段显存要留给 whisper。
+            if AUTO_START_BACKEND and time.time() - _BACKEND_TRIES.get(rid, 0.0) > _BACKEND_COOLDOWN:
+                _BACKEND_TRIES[rid] = time.time()
+                log_to(st, "[后端] 尝试自动拉起翻译后端…")
+                done, msg = start_backend(o, log_cb=lambda m: log_to(st, m), load_model=False)
+                log_to(st, f"[后端] {'✅ ' if done else '❌ '}{msg}")
+                if done:
+                    continue                      # 立刻回到循环重新判一次
             time.sleep(20)
             continue
         st.pop("_waiting", None)
@@ -740,6 +872,7 @@ def _queue_worker() -> None:
                 continue
         _CURRENT = rid
         try:
+            threading.Thread(target=_backend_watchdog, args=(rid,), daemon=True).start()
             run_pipeline(rid)
         except Exception as e:            # run_pipeline 自己会兜异常，这里是双保险
             st["state"] = "error"
@@ -747,6 +880,41 @@ def _queue_worker() -> None:
             log_to(st, f"\n[错误] {st['error']}")
         finally:
             _CURRENT = None
+
+
+def _backend_watchdog(rid: str) -> None:
+    """任务运行期间盯着翻译后端**服务**，掉线就自动拉起来。
+
+    这一条是补 _backend_ready() 的缺口：那个检查只在**开跑前**做一次，
+    后端要是跑到一半没了，流水线会把后面每一轨的 ASR 全跑完再在翻译那步失败
+    （实测第 1 轨报 400 Model is unloaded，第 2~4 轨报 APIConnectionError，
+    十几分钟 ASR 全白跑）。这里每 20 秒复查一次。
+
+    注意只看「服务在不在」，不碰模型：LM Studio 的模型归流水线管
+    （ASR 阶段故意不加载 Sakura，翻译阶段才 load）。老版本在这里主动 load 模型，
+    正好会把分时复用废掉——ASR 跑到一半 Sakura 被塞进显存，又回到抢显存降频。
+    """
+    while _CURRENT == rid:
+        time.sleep(20)
+        if _CURRENT != rid:
+            return
+        st = RUNS.get(rid)
+        if not st or st.get("state") != "running":
+            return
+        o = st.get("options") or {}
+        if _probe_backend(_backend_base(o)):
+            continue
+        if not AUTO_START_BACKEND:
+            if not st.get("_warned_down"):
+                st["_warned_down"] = True
+                log_to(st, "[后端] ⚠ 翻译后端服务掉线，自动拉起已关闭，请手动启动")
+            continue
+        if time.time() - _BACKEND_TRIES.get(rid, 0.0) < _BACKEND_COOLDOWN:
+            continue
+        _BACKEND_TRIES[rid] = time.time()
+        log_to(st, "[后端] ⚠ 翻译后端服务掉线，自动拉起…")
+        done, msg = start_backend(o, log_cb=lambda m: log_to(st, m), load_model=False)
+        log_to(st, f"[后端] {'✅ ' if done else '❌ '}{msg}")
 
 
 def enqueue(run_id: str) -> int:
@@ -878,8 +1046,16 @@ def run_pipeline(run_id: str) -> None:
         # ---- 2) 转写 + 翻译（这两步恒定执行，界面上不再给开关）----
         cmd = build_cmd(inp, out, o)
         log_to(st, f"[执行] {' '.join(cmd[1:])}")
+        # 必须显式让子进程按 UTF-8 写 stdout。
+        # 子进程的 stdout 是管道，Python 会退回 locale 首选编码（中文 Windows = cp936/GBK），
+        # 而这边按 encoding="utf-8" 解码 —— 于是流水线每一行的中文标签都变成乱码
+        # （[清洗] → [��ϴ]），日志面板没法看，按标签着色也会失效。
+        # 实测字节：b'[\xc7\xe5\xcf\xb4]' 就是 GBK 的「清洗」。
+        # 只灌 PYTHONIOENCODING（只管 stdio）——不用 PYTHONUTF8，那会顺带改掉
+        # 子进程 open() 的默认编码，可能影响它读写素材文件。
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
+                                stderr=subprocess.STDOUT, text=True, env=env,
                                 encoding="utf-8", errors="replace", bufsize=1)
         st["proc"] = proc
         assert proc.stdout is not None
@@ -1032,6 +1208,43 @@ def health() -> dict:
     }
     _HEALTH.update(t=now, v=out)
     return out
+
+
+@app.get("/api/backend/info")
+def backend_info() -> dict:
+    """告诉前端：能不能自动拉起（找不找得到 LM Studio），以及自动拉起开没开。"""
+    return {"lms": _find_lms() or "", "app": _find_lmstudio_app() or "",
+            "auto": AUTO_START_BACKEND, "keys": _model_keys()}
+
+
+@app.post("/api/backend/start")
+def backend_start(payload: dict) -> dict:
+    """手动拉起翻译后端。同步 def → FastAPI 丢线程池，不阻塞事件循环。
+
+    冷启动可能要 1~3 分钟（拉桌面程序 + 加载 6 GB 模型），所以前端要给出等待提示。
+    """
+    o = payload.get("options")
+    if not isinstance(o, dict):
+        o = {"backend": payload.get("backend") or "lmstudio",
+             "model_name": payload.get("model_name") or "",
+             "base_url": payload.get("base_url") or ""}
+    steps: List[str] = []
+    try:
+        ok, msg = start_backend(o, log_cb=steps.append)
+    except Exception as e:                  # 兜底：绝不把 500 抛给前端
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    _HEALTH["t"] = 0.0                      # 让健康徽章下一次立刻反映真实状态
+    return {"ok": bool(ok), "msg": msg, "steps": steps,
+            "lms": _find_lms() or "", "app": _find_lmstudio_app() or ""}
+
+
+@app.post("/api/backend/auto")
+def backend_auto(payload: dict) -> dict:
+    """开关「队列等待/运行中自动拉起后端」。只作用于当前服务进程。"""
+    global AUTO_START_BACKEND
+    AUTO_START_BACKEND = bool(payload.get("on"))
+    _BACKEND_TRIES.clear()          # 关掉再打开时，别让旧冷却卡住立即拉起
+    return {"ok": True, "on": AUTO_START_BACKEND}
 
 
 @app.get("/api/browse")
@@ -1604,6 +1817,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>日语音频翻译 · onsei2lrc</title>
+<link rel="icon" href="data:,"><!-- 不请求 favicon，省掉一条 404 -->
 <style>
   :root{--bg:#0f1115;--card:#171a21;--card2:#1e222b;--line:#2a2f3a;--fg:#e6e8ee;--dim:#9aa3b2;
         --acc:#6ea8fe;--ok:#3ddc97;--warn:#ffcc66;--err:#ff6b6b}
@@ -1613,6 +1827,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   h1{font-size:20px;margin:0 0 14px}
   .badges{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
   .badge{font-size:12px;padding:3px 9px;border-radius:20px;background:var(--card2);border:1px solid var(--line);color:var(--dim)}
+  button.badge{font-family:inherit;cursor:pointer}
+  .badge.act{background:#243447;border-color:#3a5a86;color:#cfe0ff}
+  .badge.act:hover{background:#2d4160}
+  .badge.act:disabled{cursor:default;opacity:.75}
   .badge.on{color:var(--ok);border-color:#23503c}
   .badge.off{color:var(--err);border-color:#55292b}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
@@ -1647,8 +1865,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .plabel{display:flex;justify-content:space-between;font-size:12.5px;color:var(--dim);gap:12px}
   .plabel span:last-child{color:var(--fg);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%}
   .meta{font-size:12.5px;color:var(--dim);display:flex;justify-content:space-between}
-  #log{background:#0b0d11;border:1px solid var(--line);border-radius:10px;padding:12px;height:300px;overflow:auto;
-       font:12px/1.55 "Cascadia Mono",Consolas,monospace;white-space:pre-wrap;word-break:break-all;color:#c8d0dd}
+  #log{background:#0b0d11;border:1px solid var(--line);border-radius:10px;padding:10px 12px;height:340px;overflow:auto;
+       font:12px/1.6 "Cascadia Mono",Consolas,monospace;color:#c8d0dd}
+  /* 一行一个 div + 悬挂缩进：折行的部分正好对齐到正文起点（时间戳 8 字符 + 6px） */
+  #log .ln{white-space:pre-wrap;word-break:break-word;padding-left:64px;text-indent:-64px}
+  #log .ts{color:#5a6678;margin-right:6px}
+  #log .lg-err{color:#ff8a8a}
+  #log .lg-warn{color:#ffcf6b}
+  #log .lg-ok{color:#7ee2a8}
+  #log .lg-stage{color:#8ab4ff;font-weight:600;margin-top:6px}
+  #log .lg-step{color:#9fb2cc}
+  #log .lg-prog{color:#5f6b7d}
+  #log.compact .lg-prog{display:none}
+  .logbar{display:flex;align-items:center;gap:16px;margin:2px 0 8px;font-size:12.5px;color:var(--dim)}
+  .logbar label{display:flex;align-items:center;gap:6px;cursor:pointer}
   .dl{display:flex;gap:12px;flex-wrap:wrap;margin-top:6px}
   .dl a{display:block;padding:12px 18px;border-radius:10px;background:#1b2536;
         border:1px solid #2f4a6e;color:#cfe0ff;text-decoration:none;font-size:13.5px}
@@ -1722,6 +1952,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="wrap">
   <h1>日语音频翻译 · onsei2lrc</h1>
   <div class="badges" id="badges"></div>
+  <div class="logbar" id="backendBar">
+    <label><input type="checkbox" id="autoBackend" checked> 后端掉线时自动拉起 LM Studio</label>
+    <span id="backendHint"></span>
+  </div>
 
   <div class="card">
     <h2>① 导入</h2>
@@ -1894,6 +2128,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 
   <div class="card">
     <h2>④ 日志</h2>
+    <div class="logbar">
+      <label><input type="checkbox" id="logCompact"> 精简（隐藏「…N/M 块」转写进度行）</label>
+      <button class="badge" id="logClear">清空</button>
+    </div>
     <div id="log"></div>
   </div>
 
@@ -1940,19 +2178,66 @@ function clearRunId(){ runId = null; }
 const $ = id => document.getElementById(id);
 const drop = $('drop'), pick = $('pick');
 
+let backendBusy = false, backendMsg = '';
+
 async function loadHealth(){
+  if (backendBusy) return;          // 拉起过程中别重建顶栏，否则按钮状态被冲掉
   try{
     const h = await (await fetch('/api/health')).json();
     const b = [];
     b.push(`<span class="badge ${h.ffmpeg?'on':'off'}">ffmpeg ${h.ffmpeg?'就绪':'缺失'}</span>`);
     b.push(`<span class="badge ${h.asr_model?'on':'off'}">ASR 模型 ${h.asr_model?'已下载':'未下载'}</span>`);
     b.push(`<span class="badge ${h.lmstudio?'on':'off'}">LM Studio ${h.lmstudio?'在线':'未启动'}</span>`);
+    if (!h.lmstudio)
+      b.push(`<button class="badge act" id="btnStartBackend" title="启动 LM Studio 并加载当前设定的模型">↑ 拉起 LM Studio</button>`);
     b.push(`<span class="badge ${h.llamacpp?'on':'off'}">llama.cpp ${h.llamacpp?'在线':'未启动'}</span>`);
     b.push(`<span class="badge ${h.ollama?'on':'off'}">Ollama ${h.ollama?'在线':'未启动'}</span>`);
+    if (backendMsg) b.push(`<span class="badge ${backendMsg.startsWith('✅')?'on':'off'}">${backendMsg}</span>`);
     $('badges').innerHTML = b.join('');
   }catch(e){ $('badges').innerHTML = '<span class="badge off">健康检查失败</span>'; }
 }
 loadHealth(); setInterval(loadHealth, 8000);
+
+// 手动拉起翻译后端。冷启动 = 拉桌面程序 + 加载 6 GB 模型，1~3 分钟是正常的。
+$('badges').addEventListener('click', async e => {
+  if (e.target.id !== 'btnStartBackend' || backendBusy) return;
+  backendBusy = true;
+  const btn = e.target;
+  btn.disabled = true;
+  btn.textContent = '正在拉起…（首次 1~3 分钟）';
+  let msg;
+  try {
+    const r = await fetch('/api/backend/start', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({backend: ($('backend') || {}).value || 'lmstudio',
+                            model_name: ($('model_name') || {}).value.trim()})});
+    const j = await r.json();
+    msg = (j.ok ? '✅ ' : '❌ ') + (j.msg || '失败');
+    if (j.steps && j.steps.length) console.log('[拉起后端]\n' + j.steps.join('\n'));   // 明细进控制台
+  } catch(err){ msg = '❌ ' + err; }
+  backendBusy = false;
+  backendMsg = msg.slice(0, 90);
+  loadHealth();
+});
+
+// 后端能力与自动拉起开关
+async function loadBackendInfo(){
+  try{
+    const j = await (await fetch('/api/backend/info')).json();
+    $('autoBackend').checked = !!j.auto;
+    if (j.app)      $('backendHint').textContent = '已找到 LM Studio，可自动拉起';
+    else if (j.lms) $('backendHint').textContent = '只找到 lms，可能拉不起桌面程序';
+    else { $('backendHint').textContent = '没找到 LM Studio，只能手动启动'; $('autoBackend').disabled = true; }
+  }catch(e){ $('backendHint').textContent = ''; }
+}
+loadBackendInfo();
+$('autoBackend').onchange = () => fetch('/api/backend/auto', {method:'POST',
+  headers:{'Content-Type':'application/json'},
+  body: JSON.stringify({on: $('autoBackend').checked})});
+
+// 日志工具：精简（CSS 折叠转写进度行）+ 清空
+$('logCompact').onchange = () => $('log').classList.toggle('compact', $('logCompact').checked);
+$('logClear').onclick = () => { $('log').textContent = ''; };
 
 drop.onclick = e => { if (e.target.tagName !== 'BUTTON') pick.click(); };
 $('btnPickFiles').onclick = e => { e.stopPropagation(); pick.click(); };
@@ -2287,17 +2572,31 @@ $('cancel').onclick = async () => {
 let Q = {pending: [], current: null, finished: []};
 let activeId = null;
 
+// 轮询循环只允许存在一条。
+// tick() 会被好几个地方调用（加入队列 / 取消 / 继续 / 移除），而它自己又会
+// setTimeout 排下一次——之前每调一次就多起一条永久循环，两条循环各自拿着
+// **同一个** since 去请求日志，于是同一批行被追加两遍。
+// 这就是「日志重复两遍」的根因。用一个自增代号解决：谁最后调用谁活着，
+// 旧循环在它下一轮醒来时自己退出；配合 pollStatus 的在飞锁，双保险。
+let tickGen = 0;
+
 async function tick(){
-  try {
-    Q = await (await fetch('/api/queue')).json();
-  } catch(e){ setTimeout(tick, 1200); return; }
-  renderQueue();
-  // 正在跑的任务换了 → 日志区切到新任务，写回结果也清掉（那是上一个任务的）
-  const cur = Q.current && Q.current.id;
-  if (cur && cur !== activeId){ activeId = cur; since = 0; $('log').textContent = ''; wbMsg = ''; }
-  if (activeId) await pollStatus(activeId);
-  setTimeout(tick, 800);
+  const gen = ++tickGen;
+  while (gen === tickGen){
+    try {
+      Q = await (await fetch('/api/queue')).json();
+    } catch(e){ await sleep(1200); continue; }
+    if (gen !== tickGen) return;                 // 已被更新的循环取代
+    renderQueue();
+    // 正在跑的任务换了 → 日志区切到新任务，写回结果也清掉（那是上一个任务的）
+    const cur = Q.current && Q.current.id;
+    if (cur && cur !== activeId){ activeId = cur; since = 0; $('log').textContent = ''; wbMsg = ''; }
+    if (activeId) await pollStatus(activeId);
+    await sleep(800);
+  }
 }
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function fmtSec(s){
   if (s == null) return '';
@@ -2372,7 +2671,61 @@ function renderQueue(){
   if ($('cancel')) $('cancel').disabled = !Q.current;
 }
 
+// ---- 日志渲染 ------------------------------------------------------------------------
+// 一行一个 div：按前缀着色、长行折行，比原来一整块 textContent 好扫读得多。
+// 「精简」用 CSS 把每 20 块一条的转写进度折掉——长任务里它们是绝大多数行。
+const LOG_MAX_LINES = 2000;
+
+const LOG_RULES = [
+  [/^\[(错误|失败)\]|Traceback|Error[:：]/,                       'lg-err'],
+  [/^\[(等待|警告)\]|^\[重试\]|^\[后端\][^\n]*[⚠❌]/,              'lg-warn'],
+  [/^\[后端\][^\n]*✅|^\[(完成|写回)\]|✅/,                        'lg-ok'],
+  [/^=+ ?\[/,                                                    'lg-stage'],
+  [/^\s*…\d+\/\d+\s*块/,                                         'lg-prog'],
+  [/^\[(ASR|VAD|混合切块|清洗|翻译|缓存|输入|输出|配置|执行|CUDA|术语表|下载|跳过转码)\]/, 'lg-step'],
+];
+
+function logClass(body){
+  for (const [re, cls] of LOG_RULES) if (re.test(body)) return cls;
+  return '';
+}
+
+function appendLog(lines){
+  const el = $('log');
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+  const frag = document.createDocumentFragment();
+  for (const raw of lines){
+    if (raw == null) continue;
+    let ts = '', body = raw;
+    const m = /^\[(\d{2}:\d{2}:\d{2})\]\s?/.exec(raw);   // 服务端加的时间戳单独成列
+    if (m){ ts = m[1]; body = raw.slice(m[0].length); }
+    const d = document.createElement('div');
+    d.className = 'ln ' + logClass(body);
+    if (ts){
+      const s = document.createElement('span');
+      s.className = 'ts';
+      s.textContent = ts;
+      d.appendChild(s);
+    }
+    d.appendChild(document.createTextNode(body));
+    frag.appendChild(d);
+  }
+  el.appendChild(frag);
+  while (el.childElementCount > LOG_MAX_LINES) el.removeChild(el.firstChild);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+let polling = false;                  // 同一时刻只允许一个 /api/status 在飞
+
 async function pollStatus(id){
+  // 两个调用同时在飞时，两边都会用切换前读到的 since 去请求，
+  // 拿到同一批行各追加一遍 → 日志重复。这里直接挡掉后来者。
+  if (polling) return;
+  polling = true;
+  try { await pollStatusOnce(id); } finally { polling = false; }
+}
+
+async function pollStatusOnce(id){
   let j;
   try { j = await (await fetch(`/api/status?run_id=${encodeURIComponent(id)}&since=${since}`)).json(); }
   catch(e){ return; }
@@ -2381,12 +2734,7 @@ async function pollStatus(id){
     since = 0; $('log').textContent = '';
     return;
   }
-  if (j.log && j.log.length){
-    const el = $('log');
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    el.textContent += (el.textContent ? '\n' : '') + j.log.join('\n');
-    if (atBottom) el.scrollTop = el.scrollHeight;
-  }
+  if (j.log && j.log.length) appendLog(j.log);
   if (typeof j.next === 'number') since = j.next;
 
   const p = j.progress || {};

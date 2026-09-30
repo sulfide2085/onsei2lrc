@@ -33,15 +33,18 @@ onsei2lrc.py —— 日语音频 → 中日双语 LRC
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # --------------------------------------------------------------------------------------
 # 常量
@@ -858,6 +861,351 @@ def translate_all(args, segs: List[Seg]) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# 2.5) 显存编排：ASR 与 Sakura 分时进出显存
+#
+# 为什么要把流程切成两段：Sakura-7B 常驻要吃 6.25 GB，而卡只有 8 GB。
+# 两者同时在场时显存贴顶，WDDM 开始换页 + GPU 发热降频，ASR 直接掉速
+# （本机实测同一批音频：显存干净时 20.0x 实时，Sakura 在场时 3.7x —— 慢 5.4 倍）。
+# 所以改成：ASR 阶段显存里只有 whisper，跑完就放掉；翻译阶段显存里只有 Sakura，译完也放掉。
+# --------------------------------------------------------------------------------------
+
+# 标识符 → LM Studio 模型键。
+# `lms load` 收的是**磁盘上的模型键**，而 --identifier 起的名字是 API 里用的别名，
+# 两者通常对不上（sakura37 ≠ sakura-galtransl-7b-v3.7）。不映射会直接找不到模型。
+MODEL_KEY_HINTS = {
+    "sakura37":    "sakura-galtransl-7b-v3.7",
+    "sakura":      "sakura-7b-qwen2.5-v1.0",
+    "galtransl4b": "galtransl-v4-4b-2601",
+}
+
+
+def find_lms() -> Optional[str]:
+    """定位 lms 命令行（PATH → ~/.lmstudio/bin → LM Studio 安装目录）。"""
+    exe = "lms.exe" if os.name == "nt" else "lms"
+    cands: List[str] = []
+    w = shutil.which("lms")
+    if w:
+        cands.append(w)
+    cands.append(str(Path.home() / ".lmstudio" / "bin" / exe))
+    if os.name == "nt":
+        for root in (os.environ.get("LOCALAPPDATA"), os.environ.get("ProgramFiles")):
+            if root:
+                cands.append(str(Path(root) / "LM Studio" / "resources" / "app" / ".webpack" / exe))
+    for c in cands:
+        try:
+            if c and Path(c).is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def run_lms(argv: List[str], timeout: float = 300.0) -> Tuple[int, str]:
+    """跑一条 lms 命令，返回 (返回码, 合并输出)。超时/异常都变成返回码，不抛。"""
+    lms = find_lms()
+    if not lms:
+        return 127, "找不到 lms 命令行（LM Studio 未安装或没生成 lms）"
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        p = subprocess.run([lms] + argv, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout, creationflags=flags)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        return 124, f"`lms {' '.join(argv)}` 超过 {timeout:.0f}s 没返回"
+    except Exception as e:
+        return 1, f"{type(e).__name__}: {e}"
+
+
+def gpu_mem_used() -> Optional[float]:
+    """当前显存占用（GB，多卡取最大）。拿不到就返回 None——只是展示用，不能因此中断流程。"""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10).stdout
+        vals = [float(x) / 1024 for x in out.split() if x.strip().replace(".", "").isdigit()]
+        return max(vals) if vals else None
+    except Exception:
+        return None
+
+
+def _vram_suffix() -> str:
+    v = gpu_mem_used()
+    return f"，显存 {v:.1f} GB" if v is not None else ""
+
+
+def backend_loaded() -> List[str]:
+    """当前 LM Studio 里已加载实例的标识符列表（拿不到就返回空）。"""
+    rc, out = run_lms(["ps"], timeout=60)
+    if rc != 0:
+        return []
+    ids: List[str] = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if parts and not parts[0].startswith("-"):
+            ids.append(parts[0])
+    return ids
+
+
+def backend_load(args) -> bool:
+    """翻译阶段开始前把 Sakura 加载进显存。返回是否就绪。
+
+    只有 LM Studio + --manage-backend 才由我们接管；其它后端（llama.cpp / Ollama /
+    DeepSeek）各有各的常驻方式，不该越权去动。
+    """
+    if not getattr(args, "manage_backend", False) or args.translator == "none":
+        return True
+    if (getattr(args, "preset", None) or "") != "lmstudio":
+        return True
+    ident = (args.model_name or "").strip()
+    if not ident:
+        return True
+    if ident in backend_loaded():
+        log(f"[后端] {ident} 已在显存中，跳过加载")
+        return True
+    key = MODEL_KEY_HINTS.get(ident, ident)
+    log(f"[后端] 加载 Sakura：{key}（API 标识符 {ident}）{_vram_suffix()}")
+    t0 = time.time()
+    rc, out = run_lms(["load", key, "--gpu", "max", "--context-length", "8192",
+                       "--identifier", ident, "-y"], timeout=600)
+    if rc != 0:
+        log(f"[后端] ✗ 加载失败（返回码 {rc}）：{out[-300:]}")
+        return False
+    log(f"[后端] ✓ 就绪，用时 {time.time() - t0:.1f}s{_vram_suffix()}")
+    return True
+
+
+def backend_unload(args, reason: str = "") -> None:
+    """把模型从显存卸掉。失败只提示，不影响产出。"""
+    if not getattr(args, "manage_backend", False):
+        return
+    if (getattr(args, "preset", None) or "") != "lmstudio":
+        return
+    ident = (args.model_name or "").strip()
+    if not ident or ident not in backend_loaded():
+        return
+    rc, out = run_lms(["unload", ident], timeout=180)
+    tail = f"（{reason}）" if reason else ""
+    if rc == 0:
+        log(f"[后端] 已卸载 {ident}{tail}{_vram_suffix()}")
+    else:
+        log(f"[后端] 卸载 {ident} 失败（返回码 {rc}）：{out[-200:]}")
+
+
+def free_asr_model() -> None:
+    """把 ASR 模型从显存里放掉。
+
+    ctranslate2 没有显式 unload 接口，唯一办法是丢掉引用 + gc，让析构去释放。
+    必须把 _MODEL_CACHE 整表清掉——留着的话下一个文件又会命中缓存把它拉回来。
+    """
+    if not _MODEL_CACHE:
+        return
+    before = gpu_mem_used()
+    _MODEL_CACHE.clear()
+    gc.collect()
+    try:                                    # torch 只用来归还它的缓存分配器；没有也不影响
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    after = gpu_mem_used()
+    if before is not None and after is not None:
+        log(f"[ASR] 已卸载转写模型，显存 {before:.1f} GB → {after:.1f} GB")
+    else:
+        log("[ASR] 已卸载转写模型")
+
+
+# --------------------------------------------------------------------------------------
+# 2.6) 文件名翻译（原本在 webui.py 的下载阶段，挪到这里是为了赶上 Sakura 在场的那段时间）
+# --------------------------------------------------------------------------------------
+
+_NAME_PROMPT = (
+    "把下面的日文音频文件名逐行翻译成简体中文。要求：\n"
+    "1. 输出行数必须与输入完全一致，一行一个，不要合并或拆分\n"
+    "2. 编号与章号**原样照抄**：「第1章」就是「第1章」，不要改成「序章1」或「第一章」；\n"
+    "   括号与分隔符（『』 / 【】）也保留\n"
+    "3. 译名要简洁，像文件名而不是句子；不要加引号、序号或任何解释\n"
+    "4. 逐词直译，不要省略或概括（长词就完整译出，不要缩写成更短的近义词）\n"
+    "5. 这些是音声作品的固定用语，必须按此翻译：\n"
+    "   トラック = 音轨（**不是「卡车」**）；パート = part；プロローグ = 序章；\n"
+    "   エピローグ = 尾声；添い寝 = 陪睡；おまけ = 附赠；本編 = 正篇\n"
+    "6. 人名一律保留原文汉字：「零」「舞」这类单字名不要当成数字或普通词翻译\n"
+    "7. 数字与英文字母一律用半角（4 而不是 ４）"
+)
+
+# 全角 → 半角（模型偶尔会输出全角数字/字母，文件名里会显得很怪）
+_FULLWIDTH = str.maketrans(
+    "０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
+    "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+    "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+# 文件名开头的编号：第2-2章 / 第1章 / 03 / 2-1 …
+_PREFIX_RE = re.compile(
+    r"^\s*(第\s*[0-9０-９]+\s*(?:[-－ー][0-9０-９]+)?\s*[章話回]"
+    r"|[0-9０-９]+\s*(?:[-－ー][0-9０-９]+)?)")
+
+
+def _keep_prefix(orig: str, trans: str) -> str:
+    """确保译文保留原名的编号前缀。
+
+    模型很爱把「第1章…プロローグ…」整条改写成「序章…」——编号一丢，
+    文件排序就乱了。编号是结构信息不是内容，这里用确定性规则兜住。
+    """
+    m = _PREFIX_RE.match(orig)
+    if not m:
+        return trans
+    pre = m.group(1).strip().translate(_FULLWIDTH)
+    if not pre:
+        return trans
+    head = trans.translate(_FULLWIDTH)[:len(pre) + 4]
+    return trans if pre in head else f"{pre} {trans}"
+
+
+def _balance(s: str) -> str:
+    """补齐模型漏掉的右括号。
+
+    实测模型会把「第2章　『お寺内』」译成「第2章 『寺庙里」——左括号留着，
+    右括号丢了。括号是结构信息，用确定性规则补齐。
+    """
+    for l, r in (("『", "』"), ("「", "」"), ("【", "】"), ("（", "）"), ("《", "》")):
+        n = s.count(l) - s.count(r)
+        if n > 0:
+            s += r * n
+    return s
+
+
+def _clean_name(s: str) -> str:
+    """清掉模型可能带上的序号/引号，并做 Windows 文件名安全化。"""
+    s = s.strip().strip('"\'“”')
+    s = re.sub(r"^\s*\d+\s*[.、):：]\s*", "", s)          # 去掉 "1. " / "1、"
+    s = s.translate(_FULLWIDTH)                           # ４ → 4
+    s = _balance(s)                                       # 补右括号
+    s = s.replace("　", " ")                              # 全角空格在部分工具里会出问题
+    s = re.sub(r'[\\/:*?"<>|]', "", s)                    # Windows 非法字符
+    s = re.sub(r"\s+", " ", s).strip().rstrip(". ")       # 结尾的点和空格 Windows 不允许
+    if s.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL",
+                                   *[f"COM{i}" for i in range(1, 10)],
+                                   *[f"LPT{i}" for i in range(1, 10)]}:
+        s = "_" + s
+    return s[:120] or "unnamed"
+
+
+def filenames_json_path(outdir) -> Path:
+    """文件名译名落盘的位置（放在输出目录根下）。"""
+    return Path(outdir) / "_filenames.json"
+
+
+def translate_filenames(stems: List[str], cfg: dict, log_cb=None) -> Dict[str, str]:
+    """把音频文件名（不含扩展名）翻译成中文，返回 {原名: 译名}。
+
+    cfg 需要：base_url / api_key / model_name / protocol / max_tokens / glossary_text。
+    采样温度**必须压低**：文件名翻译是「翻译」不是「创作」，用服务端默认温度（通常 0.8）
+    实测同一批跑两遍有 85% 的条目不一样，纯噪声。
+    """
+    say = log_cb or (lambda _m: None)
+    if not stems:
+        return {}
+    if not cfg.get("base_url"):
+        say("[文件名] 未配置后端，跳过文件名翻译")
+        return {}
+
+    args = argparse.Namespace(
+        base_url=cfg.get("base_url"),
+        api_key=cfg.get("api_key") or "",
+        timeout=cfg.get("timeout", 180.0),
+        model_name=cfg.get("model_name") or "sakura",
+        protocol=cfg.get("protocol", "sakura"),
+        max_tokens=cfg.get("max_tokens", 2048),
+        temperature=0.2, top_p=0.9, frequency_penalty=0.0,
+    )
+    client = _make_client(args)
+
+    system = _NAME_PROMPT
+    gl = (cfg.get("glossary_text") or "").strip()
+    if gl:
+        # 只取规则行，去掉注释，免得把说明文字也喂进去
+        rules = [l for l in gl.splitlines() if l.strip() and not l.strip().startswith("#")]
+        if rules:
+            system += "\n\n参考术语表（务必遵守）：\n" + "\n".join(rules[:40])
+
+    out: Dict[str, str] = {}
+    B = 10                                                 # 一次 10 条，行数对齐更稳
+    for i in range(0, len(stems), B):
+        chunk = stems[i:i + B]
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content": "\n".join(chunk)}]
+        got = None
+        for _ in range(3):                                 # 行数不匹配就重发，最多 3 次
+            try:
+                txt = _chat(client, args, msgs)
+            except Exception as e:
+                say(f"[文件名] 调用失败：{type(e).__name__}: {e}")
+                break
+            lines = [x for x in (txt or "").splitlines() if x.strip()]
+            if len(lines) == len(chunk):
+                got = lines
+                break
+        if got:
+            for src, dst in zip(chunk, got):
+                out[src] = _keep_prefix(src, _clean_name(dst))
+        else:
+            say(f"[文件名] 第 {i // B + 1} 批对齐失败，这批保留原名")
+    # 去重：译名撞车时补序号，否则后一个会覆盖前一个
+    seen: dict = {}
+    for k, v in list(out.items()):
+        base, n = v, 2
+        while v in seen:
+            v = f"{base} ({n})"
+            n += 1
+        seen[v] = k
+        out[k] = v
+    say(f"[文件名] 已翻译 {len(out)}/{len(stems)} 个文件名")
+    return out
+
+
+def _do_names(args, files) -> Optional[dict]:
+    """文件名翻译：蹭 Sakura 还在显存里的这段时间一起做掉。
+
+    结果写到 <outdir>/_filenames.json，WebUI 打包时直接读，
+    省掉「为了几个文件名再加载一次 6 GB 模型」。
+    """
+    stems: List[str] = []
+    for f, _root in files:
+        if f.stem not in stems:
+            stems.append(f.stem)
+    if not stems:
+        return None
+    cfg = {
+        "base_url": args.base_url,
+        "api_key": args.api_key or "",
+        "model_name": args.model_name,
+        "protocol": args.protocol,
+        "max_tokens": args.max_tokens,
+        "glossary_text": getattr(args, "glossary_text", "") or "",
+        "timeout": args.timeout,
+    }
+    t0 = time.time()
+    try:
+        nm = translate_filenames(stems, cfg, log_cb=log)
+    except Exception as e:
+        log(f"[文件名] 翻译失败，保留原文件名：{type(e).__name__}: {e}")
+        return None
+    el = time.time() - t0
+    if not nm:
+        return None
+    if args.outdir:
+        p = filenames_json_path(args.outdir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(nm, ensure_ascii=False, indent=1), encoding="utf-8")
+        log(f"[文件名] 译名已存 {p.name}（{p.parent}）")
+    else:
+        log("[文件名] 未指定 --outdir，译名不落盘（WebUI 靠它做下载改名）")
+    return {"count": len(nm), "sec": el}
+
+
+# --------------------------------------------------------------------------------------
 # 3) 输出
 # --------------------------------------------------------------------------------------
 
@@ -924,68 +1272,204 @@ def _write_cache(cache: Path, audio: Path, args, segs: List[Seg]) -> None:
          "segments": [asdict(s) for s in segs]}, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def process_one(args, audio: Path, root: Optional[Path] = None) -> None:
-    # 输出目录：镜像输入的相对子目录结构，避免不同子目录里的同名音轨互相覆盖
-    # （例如 1.本編\4-1.xxx.wav 与 3.SEなし\4-1.xxx.wav 同名）
+def probe_duration(audio: Path) -> float:
+    """用 ffprobe 取音频时长（秒）。拿不到返回 0——只是用于报速度，不能因此中断。"""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "csv=p=0", str(audio)],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        return float(out)
+    except Exception:
+        return 0.0
+
+
+def _out_base(args, audio: Path, root: Optional[Path]) -> Path:
+    """输出目录：镜像输入的相对子目录结构，避免不同子目录里的同名音轨互相覆盖
+    （例如 1.本編\4-1.xxx.wav 与 3.SEなし\4-1.xxx.wav 同名）。"""
     base = Path(args.outdir) if args.outdir else audio.parent
     if args.outdir and root is not None:
         try:
-            rel = audio.parent.relative_to(root)
-            base = base / rel
+            base = base / audio.parent.relative_to(root)
         except ValueError:
             pass
     base.mkdir(parents=True, exist_ok=True)
-    # 注意：不能用 Path.with_suffix()——像 "1.イントロ.wav" 这种文件名，Path 会把
-    # ".イントロ" 当成扩展名替换掉，导致输出变成 "1.lrc"（描述丢了）。一律用字符串拼接。
-    stem = base / audio.stem
-    cache = base / (audio.stem + ".segments.json")
+    return base
 
+
+def _cache_path(args, audio: Path, root: Optional[Path]) -> Path:
+    # 注意：不能用 Path.with_suffix()——像 "1.イントロ.wav" 这种文件名，Path 会把
+    # ".イントロ" 当成扩展名替换掉，导致输出变成 "1.lrc"（描述丢了）。一律字符串拼接。
+    return _out_base(args, audio, root) / (audio.stem + ".segments.json")
+
+
+def _read_cache(args, cache: Path) -> Optional[List[Seg]]:
+    """读回 segments.json，顺带做配置指纹校验。文件不存在返回 None。"""
+    if not cache.exists():
+        return None
+    blob = json.loads(cache.read_text(encoding="utf-8"))
+    segs = [Seg(**d) for d in blob["segments"]]
+    old_meta = blob.get("meta")
+    if args.reuse_translation and old_meta and old_meta != _signature(args):
+        log("[翻译] 检测到术语表/模型/参数已变化 → 忽略缓存译文，本次全部重译")
+        args.reuse_translation = False
+    elif args.reuse_translation and not old_meta and not getattr(args, "_meta_warned", False):
+        log("[提示] 该缓存来自旧版本、没有配置指纹，本次按原样复用译文；"
+            "若要应用新术语表/新参数，请去掉 --reuse-translation 重跑一次")
+        args._meta_warned = True
+    return segs
+
+
+# --------------------------------------------------------------------------------------
+# 阶段一：只做 ASR（把所有音轨都转写完，才轮到翻译）
+# --------------------------------------------------------------------------------------
+
+def asr_one(args, audio: Path, root: Optional[Path] = None) -> dict:
+    """转写一轨并落盘缓存。返回该轨的统计（时长/耗时/行数）用于收尾报告。"""
+    base = _out_base(args, audio, root)
+    cache = base / (audio.stem + ".segments.json")
+    t0 = time.time()
+
+    segs: Optional[List[Seg]] = None
+    cached = False
     if args.from_json:
-        segs = [Seg(**d) for d in json.loads(Path(args.from_json).read_text(encoding="utf-8"))["segments"]]
+        segs = [Seg(**d) for d in
+                json.loads(Path(args.from_json).read_text(encoding="utf-8"))["segments"]]
         log(f"[缓存] 从 {args.from_json} 载入 {len(segs)} 段")
-    elif args.retranslate and cache.exists():
-        blob = json.loads(cache.read_text(encoding="utf-8"))
-        segs = [Seg(**d) for d in blob["segments"]]
-        log(f"[缓存] 复用 {cache.name} 的 {len(segs)} 段转写结果")
-        # 配置指纹变了（换了术语表/模型/参数）→ 旧译文不可信，全部重译
-        old_meta = blob.get("meta")
-        if args.reuse_translation and old_meta and old_meta != _signature(args):
-            log("[翻译] 检测到术语表/模型/参数已变化 → 忽略缓存译文，本次全部重译")
-            args.reuse_translation = False
-        elif args.reuse_translation and not old_meta and not getattr(args, "_meta_warned", False):
-            log("[提示] 该缓存来自旧版本、没有配置指纹，本次按原样复用译文；"
-                "若要应用新术语表/新参数，请去掉 --reuse-translation 重跑一次")
-            args._meta_warned = True
-    else:
+        cached = True
+    elif args.retranslate:
+        segs = _read_cache(args, cache)
+        if segs is not None:
+            log(f"[缓存] 复用 {cache.name} 的 {len(segs)} 段转写结果")
+            cached = True
+
+    if segs is None:
         segs = transcribe(args, audio)
         _write_cache(cache, audio, args, segs)
         log(f"[缓存] 转写结果已存 {cache.name}（下次可用 --retranslate 跳过 ASR）")
-
-    # 从缓存载入时也要套用修正表，否则 --retranslate 会漏掉修正
-    if getattr(args, "asr_fixes", None) and (args.from_json or args.retranslate):
+    elif getattr(args, "asr_fixes", None) and (args.from_json or args.retranslate):
+        # 从缓存载入时也要套用修正表，否则 --retranslate 会漏掉修正
         k = apply_asr_fixes(segs, args.asr_fixes)
         if k:
             log(f"[修正] ASR 修正表改动 {k} 段（原文留档在 ja_raw）")
             _write_cache(cache, audio, args, segs)
 
+    el = time.time() - t0
+    dur = probe_duration(audio)
+    # 命中缓存时耗时就该是 ~0，算出来的「x 实时」会是几万倍，纯噪声——直接不给速度
+    speed = (dur / el) if (not cached and dur > 0 and el > 0.05) else 0.0
+    tail = "（命中缓存，未重新转写）" if cached else (f" / {speed:.1f}x 实时" if speed else "")
+    log(f"[计时] ASR {audio.name}：{dur / 60:.1f} 分钟音频 / 用时 {el:.1f}s{tail}")
+    return {"name": audio.name, "dur": dur, "sec": el, "lines": len(segs),
+            "speed": speed, "cached": cached}
+
+
+# --------------------------------------------------------------------------------------
+# 阶段二：只做翻译 + 出 LRC（此时显存里只有 Sakura，ASR 已经放掉了）
+# --------------------------------------------------------------------------------------
+
+def mt_one(args, audio: Path, root: Optional[Path] = None) -> dict:
+    """翻译一轨（载入阶段一的缓存）并输出 LRC。返回统计。"""
+    base = _out_base(args, audio, root)
+    cache = base / (audio.stem + ".segments.json")
+    segs = _read_cache(args, cache)
+    if segs is None:
+        raise RuntimeError(f"缺少转写缓存 {cache.name}，请先跑 ASR 阶段")
+    if args.retranslate:
+        log(f"[缓存] 复用 {cache.name} 的 {len(segs)} 段转写结果")
+
+    n_lines = sum(1 for s in segs if s.ja.strip())
+    t0 = time.time()
+    reused = False
     if args.translator != "none":
         if args.reuse_translation and all(s.zh.strip() or not s.ja.strip() for s in segs):
             log("[翻译] 缓存里已有全部译文，跳过翻译（换 --lrc-mode 重新输出时可省时间）")
+            reused = True
         else:
             translate_all(args, segs)
         _write_cache(cache, audio, args, segs)      # 两种情况都写，保证配置指纹落盘
+    el = time.time() - t0
 
-    header = args.title or stem.name
+    n_zh = sum(1 for s in segs if s.zh.strip())
+    speed = (n_zh / el) if (not reused and el > 0.05 and n_zh) else 0.0
+    tail = "（命中缓存，未重新翻译）" if reused else (f" / {speed:.1f} 行每秒" if speed else "")
+    log(f"[计时] 翻译 {audio.name}：{n_zh} 行 / 用时 {el:.1f}s{tail}")
+
+    stem_name = audio.stem
+    header = args.title or stem_name
     if args.lrc_mode != "none":
         # 纯中文是主产物，直接用 <名字>.lrc（播放器可直接识别）；
         # 只有非中文的产物才加标记：.ja / .zh-ja / .inline
         suffix = {"zh": "", "ja": ".ja", "both": ".zh-ja", "inline": ".inline"}[args.lrc_mode]
-        write_lrc(base / (audio.stem + suffix + ".lrc"), segs, args.lrc_mode, header)
+        write_lrc(base / (stem_name + suffix + ".lrc"), segs, args.lrc_mode, header)
     # 额外输出日文原文 LRC：用于校对，也方便换模型重译时对照
     if args.keep_ja and args.lrc_mode not in ("ja", "both", "inline"):
-        write_lrc(base / (audio.stem + ".ja.lrc"), segs, "ja", header)
+        write_lrc(base / (stem_name + ".ja.lrc"), segs, "ja", header)
     if args.srt:
-        write_srt(base / (audio.stem + ".srt"), segs, bilingual=args.translator != "none")
+        write_srt(base / (stem_name + ".srt"), segs, bilingual=args.translator != "none")
+
+    return {"name": audio.name, "lines": n_zh, "ja_lines": n_lines, "sec": el,
+            "speed": speed, "reused": reused}
+
+
+def _fmt_sec(s: float) -> str:
+    s = int(round(s))
+    return f"{s // 60}分{s % 60:02d}秒" if s >= 60 else f"{s}秒"
+
+
+def print_report(asr_stats: List[dict], mt_stats: List[dict], name_stat: Optional[dict],
+                 total_sec: float, vram_asr: Optional[float], vram_mt: Optional[float],
+                 phases: str) -> None:
+    """收尾报告：整体速度与用时 + 逐轨明细。"""
+    log("")
+    log("=" * 74)
+    log("完成报告")
+    log("=" * 74)
+
+    if asr_stats:
+        fresh = [s for s in asr_stats if not s.get("cached")]
+        log("")
+        if fresh:
+            dur = sum(s["dur"] for s in fresh)
+            sec = sum(s["sec"] for s in fresh)
+            sp = (dur / sec) if sec > 0 else 0
+            extra = f"（{len(asr_stats) - len(fresh)} 轨命中缓存）" if len(fresh) < len(asr_stats) else ""
+            log(f"ASR 阶段 ：{len(asr_stats)} 轨 / {dur / 60:.1f} 分钟音频{extra}"
+                f" / 用时 {_fmt_sec(sec)} / 平均 {sp:.1f}x 实时")
+        else:
+            log(f"ASR 阶段 ：{len(asr_stats)} 轨全部命中缓存，无需重新转写")
+        log(f"{'':2}{'音轨':<36}{'音频':>10}{'用时':>11}{'速度':>10}")
+        for s in asr_stats:
+            v = "缓存" if s.get("cached") else (f"{s['speed']:.1f}x" if s["speed"] else "-")
+            log(f"{'':2}{s['name'][:35]:<36}{s['dur'] / 60:>8.1f}分{s['sec']:>10.1f}s{v:>10}")
+
+    if mt_stats:
+        fresh_mt = [s for s in mt_stats if not s.get("reused")]
+        log("")
+        if fresh_mt:
+            n_zh = sum(s["lines"] for s in fresh_mt)
+            sec = sum(s["sec"] for s in fresh_mt)
+            sp = (n_zh / sec) if sec > 0 else 0
+            extra = f"（{len(mt_stats) - len(fresh_mt)} 轨命中缓存）" if len(fresh_mt) < len(mt_stats) else ""
+            log(f"翻译阶段 ：{len(mt_stats)} 轨 / {n_zh} 行{extra}"
+                f" / 用时 {_fmt_sec(sec)} / 平均 {sp:.1f} 行每秒")
+        else:
+            log(f"翻译阶段 ：{len(mt_stats)} 轨全部命中缓存，无需重新翻译")
+        log(f"{'':2}{'音轨':<36}{'行数':>10}{'用时':>11}{'速度':>10}")
+        for s in mt_stats:
+            v = "缓存" if s.get("reused") else (f"{s['speed']:.1f}/s" if s["speed"] else "-")
+            log(f"{'':2}{s['name'][:35]:<36}{s['lines']:>10}{s['sec']:>10.1f}s{v:>10}")
+
+    if name_stat:
+        log("")
+        log(f"文件名   ：{name_stat['count']} 个 / 用时 {_fmt_sec(name_stat['sec'])}")
+
+    if phases == "all":
+        log("")
+        log(f"总计     ：{_fmt_sec(total_sec)}")
+        if vram_asr is not None and vram_mt is not None:
+            log(f"显存驻留 ：ASR 阶段 {vram_asr:.1f} GB → 翻译阶段 {vram_mt:.1f} GB"
+                f"（分时复用，不再叠加成 {vram_asr + vram_mt:.1f} GB）")
+    log("=" * 74)
 
 
 def collect_inputs(paths: Sequence[str]) -> List[tuple]:
@@ -1095,6 +1579,17 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--retranslate", action="store_true", help="复用已有 .segments.json 的转写，只重跑翻译")
     g.add_argument("--reuse-translation", action="store_true", help="缓存里已有译文时直接复用，不重复调用模型")
     g.add_argument("--from-json", help="直接从指定 segments.json 开始（跳过 ASR）")
+
+    g = p.add_argument_group("显存编排（避免 ASR 与 Sakura 抢显存导致降频）")
+    g.add_argument("--phases", default="all", choices=["all", "asr", "translate"],
+                   help="all=先跑完所有 ASR 再统一翻译（默认，显存分时复用）；"
+                        "asr/translate=只跑其中一段（调试或单独重跑用）")
+    g.add_argument("--manage-backend", action="store_true",
+                   help="由本程序在翻译阶段加载 Sakura、跑完卸载（仅 LM Studio）。"
+                        "WebUI 会自动带上；命令行默认不开，免得干预你自己常驻的服务")
+    g.add_argument("--translate-names", action="store_true",
+                   help="顺便把音频文件名也译了，译名写到 <outdir>/_filenames.json。"
+                        "蹭 Sakura 在场的时间做，不用为了几个文件名再加载一次模型")
     return p
 
 
@@ -1149,14 +1644,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not files:
         log("没有找到音频文件"); return 2
     log(f"[输入] 共 {len(files)} 个文件")
-    for i, (f, root) in enumerate(files, 1):
-        log(f"\n===== [{i}/{len(files)}] {f} =====")
-        try:
-            process_one(args, f, root)
-        except KeyboardInterrupt:
-            log("已中断"); return 130
-        except Exception as e:
-            log(f"[错误] {f} 处理失败：{type(e).__name__}: {e}")
+
+    t_all = time.time()
+    asr_stats: List[dict] = []
+    mt_stats: List[dict] = []
+    name_stat: Optional[dict] = None
+    vram_asr = vram_mt = None
+
+    # ---- 阶段 1：ASR。显存里只有 whisper，全部转写完再放掉 ----
+    if args.phases in ("all", "asr"):
+        log("\n" + "=" * 74)
+        log(f"阶段 1/2：ASR 转写（{len(files)} 个文件）")
+        log("=" * 74)
+        for i, (f, root) in enumerate(files, 1):
+            log(f"\n----- [{i}/{len(files)}] {f} -----")
+            try:
+                asr_stats.append(asr_one(args, f, root))
+            except KeyboardInterrupt:
+                log("已中断"); return 130
+            except Exception as e:
+                log(f"[错误] {f} 转写失败：{type(e).__name__}: {e}")
+        vram_asr = gpu_mem_used()
+        free_asr_model()          # 腾空显存，给 Sakura 让位（这一步是整次提速的关键）
+
+    # ---- 阶段 2：翻译。此时才加载 Sakura，译完正文和文件名再放掉 ----
+    if args.phases in ("all", "translate"):
+        if args.translator != "none":
+            log("\n" + "=" * 74)
+            log(f"阶段 2/2：翻译（{len(files)} 个文件）")
+            log("=" * 74)
+            backend_load(args)
+        for i, (f, root) in enumerate(files, 1):
+            log(f"\n----- [{i}/{len(files)}] {f} -----")
+            try:
+                mt_stats.append(mt_one(args, f, root))
+            except KeyboardInterrupt:
+                log("已中断"); return 130
+            except Exception as e:
+                log(f"[错误] {f} 翻译失败：{type(e).__name__}: {e}")
+        # 文件名翻译搭 Sakura 在场的顺风车，省掉「为几个文件名再加载一次 6 GB 模型」
+        if args.translator != "none" and args.translate_names:
+            log("")
+            name_stat = _do_names(args, files)
+        vram_mt = gpu_mem_used()
+        backend_unload(args, reason="正文与文件名都已完成")
+
+    print_report(asr_stats, mt_stats, name_stat, time.time() - t_all,
+                 vram_asr, vram_mt, args.phases)
     return 0
 
 
